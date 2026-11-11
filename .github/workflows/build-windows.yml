@@ -1,0 +1,52 @@
+name: Build Windows Executable
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build Windows executable with PyInstaller
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --windowed `
+            --onedir `
+            --name "AdBlockTarayici" `
+            --hidden-import PyQt6.QtWebEngineCore `
+            --hidden-import PyQt6.QtWebEngineWidgets `
+            --hidden-import PyQt6.QtWebChannel `
+            --hidden-import PyQt6.QtSvg `
+            main.py
+
+      - name: Package Windows build as ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\AdBlockTarayici\* -DestinationPath AdBlockTarayici-Windows-x64.zip
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdBlockTarayici-Windows-x64
+          path: AdBlockTarayici-Windows-x64.zip

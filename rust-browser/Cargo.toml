@@ -1,0 +1,25 @@
+[package]
+name = "adblock-browser"
+version = "0.1.0"
+edition = "2021"
+description = "Chrome-style Privacy & AdBlock Browser built with Rust (tao + wry + adblock-rust) for macOS and Windows"
+
+[dependencies]
+tao = "0.37.2"
+wry = { version = "0.57.2", features = ["devtools", "mac-proxy"] }
+adblock = { version = "0.13.5", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes-gcm = "0.10.3"
+pbkdf2 = { version = "0.12", features = ["hmac"] }
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+ureq = "2"
+url = "2"
+html-escape = "0.2"
+chrono = "0.4"
+dirs = "5"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

@@ -1,0 +1,47 @@
+name: Build AdBlock Browser (Windows & macOS)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: rust-browser
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+      - run: cmd /c scripts\build_windows.bat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AdBlockBrowser-Windows
+          path: rust-browser/dist/windows/AdBlockBrowser
+
+  build-macos:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: rust-browser
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+      - run: bash scripts/build_macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AdBlockBrowser-macOS
+          path: rust-browser/dist/AdBlockBrowser.app
+
+  test-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python3 -m unittest discover -s tests -v

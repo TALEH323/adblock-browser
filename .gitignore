@@ -1,0 +1,22 @@
+# Personal browser data & vault secrets (NEVER commit)
+user_data/
+*.vault.key
+passwords_vault.json
+
+# Rust build & bundle outputs
+rust-browser/target/
+rust-browser/dist/
+
+# Python caches, environments & builds
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+.env
