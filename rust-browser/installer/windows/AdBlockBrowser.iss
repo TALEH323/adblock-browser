@@ -1,6 +1,8 @@
 ﻿; Inno Setup 6 Script - AdBlock Tarayıcı (Rust Edition)
 #define MyAppName "AdBlock Tarayıcı"
-#define MyAppVersion "0.1.0"
+#ifndef MyAppVersion
+  #define MyAppVersion "0.1.0"
+#endif
 #define MyAppPublisher "AdBlock Browser"
 #define MyAppExeName "AdBlockBrowser.exe"
 

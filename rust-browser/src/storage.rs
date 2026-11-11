@@ -28,6 +28,12 @@ pub struct BrowserSettings {
     pub http_allowed_domains: Vec<String>,
     #[serde(default)]
     pub total_blocked: u64,
+    #[serde(default)]
+    pub auto_launch_if_current: bool,
+    #[serde(default)]
+    pub update_manifest_url: String,
+    #[serde(default)]
+    pub update_token: String,
 }
 
 fn default_true() -> bool {
@@ -54,6 +60,9 @@ impl Default for BrowserSettings {
             whitelisted_domains: Vec::new(),
             http_allowed_domains: Vec::new(),
             total_blocked: 0,
+            auto_launch_if_current: false,
+            update_manifest_url: String::new(),
+            update_token: String::new(),
         }
     }
 }

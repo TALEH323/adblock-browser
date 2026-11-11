@@ -5,6 +5,7 @@ mod internal_pages;
 mod passwords;
 mod proxy;
 mod storage;
+mod updater;
 
 use crate::adblock_engine::{extract_host, AdBlockService, BlockedItem, SharedAdBlock};
 use crate::chrome_ui::{
@@ -15,13 +16,17 @@ use crate::dns_guard::DnsGuard;
 use crate::passwords::{PasswordManager, PASSWORD_INJECT_JS};
 use crate::proxy::{LocalSecurityProxy, ProxyEvent};
 use crate::storage::{resolve_data_dir, BrowserStorage, DownloadEntry};
+use crate::updater::{
+    check_for_updates, download_and_install_update, launcher_html, ReleaseInfo, UpdateCheckResult,
+    APP_VERSION,
+};
 use chrono::Local;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
-use tao::dpi::LogicalSize;
+use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
@@ -49,6 +54,11 @@ const TAB_SHORTCUTS_JS: &str = r###"
 
 #[derive(Debug)]
 enum UserEvent {
+    LauncherReady,
+    UpdateChecked(UpdateCheckResult),
+    UpdateProgress { percent: u8, text: String },
+    UpdateFinished(Result<bool, String>),
+    AutoLaunchBrowser,
     ChromeReady,
     Ipc { tab_id: Option<usize>, raw: String },
     TabTitleChanged { tab_id: usize, title: String },
@@ -112,6 +122,8 @@ struct IpcEnvelope {
     rule: String,
     #[serde(default)]
     height: Option<f64>,
+    #[serde(default)]
+    enabled: bool,
 }
 
 struct BrowserTab {
@@ -143,6 +155,24 @@ struct BrowserApp {
     active_tab_idx: usize,
     next_tab_id: usize,
     pending_password: Option<(String, String, String)>,
+    launcher_webview: Option<WebView>,
+    launcher_ready: bool,
+    in_launcher: bool,
+    updating_now: bool,
+    pending_update: Option<ReleaseInfo>,
+}
+
+fn center_window_logical(window: &tao::window::Window, w: f64, h: f64) {
+    if let Some(mon) = window.current_monitor().or_else(|| window.primary_monitor()) {
+        let sf = window.scale_factor();
+        let ms = mon.size();
+        let mp = mon.position();
+        let pw = (w * sf).round() as i32;
+        let ph = (h * sf).round() as i32;
+        let x = mp.x + (ms.width as i32 - pw) / 2;
+        let y = mp.y + (ms.height as i32 - ph) / 2;
+        window.set_outer_position(PhysicalPosition::new(x, y));
+    }
 }
 
 impl BrowserApp {
@@ -162,8 +192,104 @@ impl BrowserApp {
         }
     }
 
+    fn set_launcher_state(&self, state: serde_json::Value) {
+        if !self.launcher_ready {
+            return;
+        }
+        if let Some(lw) = &self.launcher_webview {
+            if let Ok(js_arg) = serde_json::to_string(&state) {
+                let _ = lw.evaluate_script(&format!(
+                    "window.__setLauncherState && window.__setLauncherState({js_arg});"
+                ));
+            }
+        }
+    }
+
+    fn start_update_check(&self) {
+        self.set_launcher_state(serde_json::json!({
+            "dot": "",
+            "title": "Güncellemeler kontrol ediliyor...",
+            "sub": "En güncel sürüm GitHub Releases üzerinden sorgulanıyor.",
+            "indeterminate": true,
+            "checking": true,
+            "can_update": false,
+            "updating": false,
+        }));
+        let manifest = self.storage.settings.update_manifest_url.clone();
+        let token = self.storage.settings.update_token.clone();
+        let ep = self.event_proxy.clone();
+        thread::spawn(move || {
+            let res = check_for_updates(&manifest, &token);
+            let _ = ep.send_event(UserEvent::UpdateChecked(res));
+        });
+    }
+
+    fn start_update_download(&mut self) {
+        let Some(info) = self.pending_update.clone() else {
+            return;
+        };
+        self.updating_now = true;
+        self.set_launcher_state(serde_json::json!({
+            "dot": "upd",
+            "title": format!("Sürüm v{} indiriliyor...", info.version),
+            "sub": "Güncelleme paketi hazırlanıyor...",
+            "indeterminate": false,
+            "progress": 5,
+            "can_update": true,
+            "updating": true,
+            "update_label": "Güncelleniyor..."
+        }));
+        let token = self.storage.settings.update_token.clone();
+        let ep = self.event_proxy.clone();
+        thread::spawn(move || {
+            let ep_prog = ep.clone();
+            let res = download_and_install_update(&info, &token, |pct, msg| {
+                let _ = ep_prog.send_event(UserEvent::UpdateProgress {
+                    percent: pct,
+                    text: msg.to_string(),
+                });
+            });
+            let _ = ep.send_event(UserEvent::UpdateFinished(res));
+        });
+    }
+
+    fn launch_browser_from_launcher(&mut self) {
+        if !self.in_launcher || self.updating_now {
+            return;
+        }
+        self.in_launcher = false;
+        if let Some(lw) = self.launcher_webview.take() {
+            let _ = lw.set_visible(false);
+            drop(lw);
+        }
+        self.window.set_resizable(true);
+        self.window.set_title("AdBlock Tarayıcı");
+        self.window.set_inner_size(LogicalSize::new(1280.0, 820.0));
+        center_window_logical(&self.window, 1280.0, 820.0);
+        let _ = self.chrome_bar.set_visible(true);
+        if self.tabs.is_empty() {
+            let home = self.storage.settings.home_url.clone();
+            self.create_tab(&home, true);
+        }
+        self.layout_views();
+        self.sync_chrome_bar();
+    }
+
     fn layout_views(&self) {
         let (w, h) = self.logical_size();
+        if self.in_launcher {
+            if let Some(lw) = &self.launcher_webview {
+                let _ = lw.set_bounds(Rect {
+                    position: LogicalPosition::new(0.0, 0.0).into(),
+                    size: WrySize::new(w, h).into(),
+                });
+                let _ = lw.set_visible(true);
+            }
+            let _ = self.chrome_bar.set_visible(false);
+            return;
+        }
+
+        let _ = self.chrome_bar.set_visible(true);
         let bh = self.bar_height();
         let _ = self.chrome_bar.set_bounds(Rect {
             position: LogicalPosition::new(0.0, 0.0).into(),
@@ -850,6 +976,27 @@ impl BrowserApp {
                 self.passwords.last_import_notice = None;
                 self.reload_active_internal_if_matching();
             }
+            "launcher_launch" => {
+                self.launch_browser_from_launcher();
+            }
+            "launcher_recheck" => {
+                self.start_update_check();
+            }
+            "launcher_start_update" => {
+                self.start_update_download();
+            }
+            "launcher_set_auto" => {
+                self.storage.settings.auto_launch_if_current = env.enabled;
+                self.storage.save_settings();
+            }
+            "launcher_save_config" => {
+                self.storage.settings.update_manifest_url = env.url.trim().to_string();
+                if !env.rules.trim().is_empty() {
+                    self.storage.settings.update_token = env.rules.trim().to_string();
+                }
+                self.storage.save_settings();
+                self.start_update_check();
+            }
             "pw_never_save" => {
                 self.passwords.mark_never_save(&env.origin);
                 self.pending_password = None;
@@ -1005,11 +1152,13 @@ fn main() {
     .ok();
 
     let window = WindowBuilder::new()
-        .with_title("AdBlock Tarayıcı (Rust)")
+        .with_title("AdBlock Tarayıcı — Başlatıcı")
         .with_window_icon(window_icon)
-        .with_inner_size(LogicalSize::new(1280.0, 820.0))
+        .with_inner_size(LogicalSize::new(560.0, 440.0))
+        .with_resizable(false)
         .build(&event_loop)
         .expect("Ana pencere oluşturulamadı");
+    center_window_logical(&window, 560.0, 440.0);
 
     let ep_bar_ipc = event_proxy.clone();
     let ep_bar_load = event_proxy.clone();
@@ -1032,6 +1181,33 @@ fn main() {
         })
         .build_as_child(&window)
         .expect("Üst araç çubuğu oluşturulamadı");
+    let _ = chrome_bar.set_visible(false);
+
+    let ep_ln_ipc = event_proxy.clone();
+    let ep_ln_load = event_proxy.clone();
+    let launcher_webview = WebViewBuilder::new()
+        .with_bounds(Rect {
+            position: LogicalPosition::new(0.0, 0.0).into(),
+            size: WrySize::new(560.0, 440.0).into(),
+        })
+        .with_html(launcher_html(
+            storage.settings.auto_launch_if_current,
+            &storage.settings.update_manifest_url,
+            !storage.settings.update_token.is_empty(),
+        ))
+        .with_ipc_handler(move |req| {
+            let _ = ep_ln_ipc.send_event(UserEvent::Ipc {
+                tab_id: None,
+                raw: req.body().clone(),
+            });
+        })
+        .with_on_page_load_handler(move |ev, _| {
+            if matches!(ev, PageLoadEvent::Finished) {
+                let _ = ep_ln_load.send_event(UserEvent::LauncherReady);
+            }
+        })
+        .build_as_child(&window)
+        .expect("Başlatıcı oluşturulamadı");
 
     let mut app = BrowserApp {
         window,
@@ -1053,10 +1229,12 @@ fn main() {
         active_tab_idx: 0,
         next_tab_id: 1,
         pending_password: None,
+        launcher_webview: Some(launcher_webview),
+        launcher_ready: false,
+        in_launcher: true,
+        updating_now: false,
+        pending_update: None,
     };
-
-    let home = app.storage.settings.home_url.clone();
-    app.create_tab(&home, true);
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -1077,6 +1255,118 @@ fn main() {
                 app.layout_views();
             }
             Event::UserEvent(ue) => match ue {
+                UserEvent::LauncherReady => {
+                    app.launcher_ready = true;
+                    app.start_update_check();
+                }
+                UserEvent::UpdateChecked(res) => match res {
+                    UpdateCheckResult::UpToDate { current, latest } => {
+                        app.pending_update = None;
+                        let auto = app.storage.settings.auto_launch_if_current;
+                        app.set_launcher_state(serde_json::json!({
+                            "dot": "ok",
+                            "title": format!("Sürüm güncel (v{current})"),
+                            "sub": if auto {
+                                format!("Son sürüm v{latest} doğrulanmıştır. Tarayıcı otomatik başlatılıyor...")
+                            } else {
+                                format!("Son sürüm v{latest} yüklü. Başlatmak için hazır.")
+                            },
+                            "indeterminate": false,
+                            "progress": 100,
+                            "checking": false,
+                            "can_update": false,
+                            "updating": false,
+                        }));
+                        if auto {
+                            let ep = app.event_proxy.clone();
+                            thread::spawn(move || {
+                                thread::sleep(std::time::Duration::from_millis(900));
+                                let _ = ep.send_event(UserEvent::AutoLaunchBrowser);
+                            });
+                        }
+                    }
+                    UpdateCheckResult::UpdateAvailable(info) => {
+                        let has_asset = info.asset_browser_url.is_some();
+                        let ver = info.version.clone();
+                        let notes = if info.notes.trim().is_empty() {
+                            format!("Yeni sürüm v{ver} indirilebilir durumda (mevcut: v{APP_VERSION}).")
+                        } else {
+                            info.notes.clone()
+                        };
+                        app.pending_update = Some(info);
+                        app.set_launcher_state(serde_json::json!({
+                            "dot": "upd",
+                            "title": format!("Yeni sürüm mevcut: v{ver}"),
+                            "sub": notes,
+                            "indeterminate": false,
+                            "progress": 0,
+                            "checking": false,
+                            "can_update": has_asset,
+                            "updating": false,
+                            "update_label": format!("v{ver} Sürümüne Güncelle")
+                        }));
+                    }
+                    UpdateCheckResult::Unavailable { current, reason } => {
+                        app.pending_update = None;
+                        app.set_launcher_state(serde_json::json!({
+                            "dot": "warn",
+                            "title": format!("Mevcut sürüm: v{current}"),
+                            "sub": reason,
+                            "indeterminate": false,
+                            "progress": 100,
+                            "checking": false,
+                            "can_update": false,
+                            "updating": false,
+                        }));
+                    }
+                },
+                UserEvent::UpdateProgress { percent, text } => {
+                    app.set_launcher_state(serde_json::json!({
+                        "dot": "upd",
+                        "title": "Güncelleme indiriliyor...",
+                        "sub": text,
+                        "indeterminate": false,
+                        "progress": percent,
+                        "can_update": true,
+                        "updating": true,
+                        "update_label": format!("İndiriliyor %{percent}")
+                    }));
+                }
+                UserEvent::UpdateFinished(res) => {
+                    app.updating_now = false;
+                    match res {
+                        Ok(true) => {
+                            app.storage.save_settings();
+                            *control_flow = ControlFlow::Exit;
+                        }
+                        Ok(false) => {
+                            app.set_launcher_state(serde_json::json!({
+                                "dot": "ok",
+                                "title": "Güncelleme paketi indirildi",
+                                "sub": "İndirilen paket klasörde açıldı.",
+                                "indeterminate": false,
+                                "progress": 100,
+                                "can_update": false,
+                                "updating": false,
+                            }));
+                        }
+                        Err(err) => {
+                            app.set_launcher_state(serde_json::json!({
+                                "dot": "warn",
+                                "title": "Güncelleme tamamlanamadı",
+                                "sub": err,
+                                "indeterminate": false,
+                                "progress": 0,
+                                "can_update": app.pending_update.is_some(),
+                                "updating": false,
+                                "update_label": "Tekrar Dene"
+                            }));
+                        }
+                    }
+                }
+                UserEvent::AutoLaunchBrowser => {
+                    app.launch_browser_from_launcher();
+                }
                 UserEvent::ChromeReady => {
                     app.chrome_ready = true;
                     app.sync_chrome_bar();
