@@ -47,13 +47,14 @@ try:
     last_tag = subprocess.check_output(
         ["git", "describe", "--tags", "--abbrev=0"], stderr=subprocess.DEVNULL
     ).decode().strip()
-    log_range = f"{last_tag}..HEAD"
+    log_args = [f"{last_tag}..HEAD"]
 except subprocess.CalledProcessError:
-    log_range = "HEAD~10..HEAD"
+    # No tag yet: use the most recent commits (works even with < 10 commits)
+    log_args = ["-n", "10", "HEAD"]
 
 try:
     raw_commits = subprocess.check_output(
-        ["git", "log", log_range, "--no-merges", "--pretty=format:%s"],
+        ["git", "log", *log_args, "--no-merges", "--pretty=format:%s"],
         stderr=subprocess.DEVNULL,
     ).decode().splitlines()
 except subprocess.CalledProcessError:

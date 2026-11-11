@@ -1,6 +1,6 @@
 [package]
 name = "adblock-browser"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Chrome-style Privacy & AdBlock Browser built with Rust (tao + wry + adblock-rust) for macOS and Windows"
 

@@ -1,9 +1,20 @@
 [
   {
+    "version": "0.2.0",
+    "date": "2026-11-12",
+    "title": "Temiz Yeni Sekme ve Otomatik Güncelleme",
+    "tag": "v0.2.0",
+    "changes": [
+      "Yeni Sekme (ana sayfa) artık sol menü olmadan temiz açılıyor; menü yalnızca Ayarlar ve diğer yönetim sayfalarında görünüyor.",
+      "Sürüm yükseltme aracı (bump_release.sh) commit geçmişi az olan depolarda da değişiklikleri doğru topluyor.",
+      "Başlatıcı üzerinden ilk otomatik güncelleme testi sürümü."
+    ]
+  },
+  {
     "version": "0.1.0",
     "date": "2026-11-12",
     "title": "İlk Saf Rust Sürümü",
-    "tag": "Mevcut",
+    "tag": "v0.1.0",
     "changes": [
       "Python/PyQt6 bağımlılığı tamamen kaldırılarak saf Rust (tao + wry + adblock-rust) mimarisine geçildi.",
       "Chrome Material You koyu arayüz, dinamik sekme çubuğu, yan panel ve açılır baloncuklar eklendi.",
