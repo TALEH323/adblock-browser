@@ -15,8 +15,14 @@ const NAV_ITEMS: &[(&str, &str, &str)] = &[
 ];
 
 fn wrap_shell(active: &str, title: &str, body_html: &str) -> String {
+    // The new-tab home page is clean (no sidebar); the sidebar only appears
+    // on settings-style internal pages (Ayarlar, İndirilenler, Şifreler ...).
+    let show_sidebar = active != "home";
     let mut nav = String::new();
     for (key, label, svg_path) in NAV_ITEMS {
+        if *key == "home" {
+            continue;
+        }
         let cls = if *key == active { "nav-item active" } else { "nav-item" };
         nav.push_str(&format!(
             r###"<button class="{cls}" onclick="sendCmd('open_internal', {{route:'{key}'}})">
@@ -25,6 +31,20 @@ fn wrap_shell(active: &str, title: &str, body_html: &str) -> String {
             </button>"###
         ));
     }
+    let aside_html = if show_sidebar {
+        format!(
+            r###"<aside>
+    <div class="brand">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#81c995" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
+      <span>AdBlock Tarayıcı</span>
+    </div>
+    {nav}
+  </aside>"###
+        )
+    } else {
+        String::new()
+    };
+    let main_cls = if show_sidebar { "" } else { "home-main" };
 
     format!(
         r###"<!DOCTYPE html>
@@ -74,6 +94,7 @@ fn wrap_shell(active: &str, title: &str, body_html: &str) -> String {
   .nav-item:hover {{ background: rgba(255,255,255,0.06); color: var(--text); }}
   .nav-item.active {{ background: rgba(138,180,248,0.16); color: var(--blue); font-weight: 600; }}
   main {{ flex: 1; padding: 32px 44px; max-width: 980px; }}
+  main.home-main {{ max-width: 860px; margin: 0 auto; }}
   .header-row {{ display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 22px; }}
   h1 {{ font-size: 22px; margin: 0; font-weight: 600; }}
   .card {{
@@ -144,14 +165,8 @@ fn wrap_shell(active: &str, title: &str, body_html: &str) -> String {
 </script>
 </head>
 <body>
-  <aside>
-    <div class="brand">
-      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#81c995" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
-      <span>AdBlock Tarayıcı</span>
-    </div>
-    {nav}
-  </aside>
-  <main>{body_html}</main>
+  {aside_html}
+  <main class="{main_cls}">{body_html}</main>
 </body>
 </html>"###,
         txt(title)
