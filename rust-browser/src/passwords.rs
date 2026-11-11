@@ -37,6 +37,21 @@ pub struct PasswordManager {
     master_secret: Vec<u8>,
     pub credentials: Vec<SavedCredential>,
     pub never_save: Vec<String>,
+    pub last_import_notice: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChromeImportReport {
+    pub added: usize,
+    pub updated: usize,
+    pub skipped: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpsertOutcome {
+    Added,
+    Updated,
+    Skipped,
 }
 
 impl PasswordManager {
@@ -50,6 +65,7 @@ impl PasswordManager {
             master_secret,
             credentials: Vec::new(),
             never_save: Vec::new(),
+            last_import_notice: None,
         };
         mgr.reload();
         mgr
@@ -136,20 +152,26 @@ impl PasswordManager {
         }
     }
 
-    pub fn add_or_update(&mut self, origin: &str, username: &str, password: &str) {
+    fn upsert_in_memory(
+        &mut self,
+        origin: &str,
+        username: &str,
+        password: &str,
+        now: &str,
+    ) -> UpsertOutcome {
         let orig = origin.trim().to_lowercase();
         let user = username.trim().to_string();
         if orig.is_empty() || password.is_empty() {
-            return;
+            return UpsertOutcome::Skipped;
         }
-        let now = Local::now().format("%Y-%m-%d %H:%M").to_string();
-        if let Some(existing) = self
+        let outcome = if let Some(existing) = self
             .credentials
             .iter_mut()
             .find(|c| c.origin == orig && c.username == user)
         {
             existing.password = password.to_string();
-            existing.updated_at = now;
+            existing.updated_at = now.to_string();
+            UpsertOutcome::Updated
         } else {
             self.credentials.insert(
                 0,
@@ -157,12 +179,96 @@ impl PasswordManager {
                     origin: orig.clone(),
                     username: user,
                     password: password.to_string(),
-                    updated_at: now,
+                    updated_at: now.to_string(),
                 },
             );
-        }
+            UpsertOutcome::Added
+        };
         self.never_save.retain(|d| d != &orig);
-        self.save();
+        outcome
+    }
+
+    pub fn add_or_update(&mut self, origin: &str, username: &str, password: &str) {
+        let now = Local::now().format("%Y-%m-%d %H:%M").to_string();
+        if self.upsert_in_memory(origin, username, password, &now) != UpsertOutcome::Skipped {
+            self.save();
+        }
+    }
+
+    /// Parse a Google Chrome Passwords CSV export (`name,url,username,password[,note]`)
+    /// and batch-upsert entries into the encrypted vault with a single PBKDF2/AES save.
+    pub fn import_chrome_csv(&mut self, csv_text: &str) -> ChromeImportReport {
+        let rows = parse_csv_rows(csv_text);
+        if rows.is_empty() {
+            self.last_import_notice =
+                Some("CSV dosyası boş veya okunamadı.".to_string());
+            return ChromeImportReport {
+                added: 0,
+                updated: 0,
+                skipped: 0,
+            };
+        }
+
+        let headers: Vec<String> = rows[0]
+            .iter()
+            .map(|h| h.trim().to_lowercase())
+            .collect();
+
+        let url_col = find_col(&headers, &["url", "origin", "website", "login_uri"]);
+        let name_col = find_col(&headers, &["name", "title"]);
+        let user_col = find_col(&headers, &["username", "user", "login_username", "email"]);
+        let pass_col = find_col(&headers, &["password", "login_password"]);
+
+        let (Some(pass_i), Some(user_i)) = (pass_col, user_col) else {
+            self.last_import_notice = Some(
+                "Geçersiz Chrome CSV biçimi: 'url, username, password' sütunları bulunamadı."
+                    .to_string(),
+            );
+            return ChromeImportReport {
+                added: 0,
+                updated: 0,
+                skipped: 0,
+            };
+        };
+
+        let mut report = ChromeImportReport {
+            added: 0,
+            updated: 0,
+            skipped: 0,
+        };
+        let now = Local::now().format("%Y-%m-%d %H:%M").to_string();
+
+        for row in rows.iter().skip(1) {
+            if row.iter().all(|c| c.trim().is_empty()) {
+                continue;
+            }
+            let raw_url = url_col.and_then(|i| row.get(i)).map(String::as_str).unwrap_or("");
+            let raw_name = name_col.and_then(|i| row.get(i)).map(String::as_str).unwrap_or("");
+            let username = row.get(user_i).map(String::as_str).unwrap_or("");
+            let password = row.get(pass_i).map(String::as_str).unwrap_or("");
+
+            let origin = normalize_chrome_origin(raw_url, raw_name);
+            match self.upsert_in_memory(&origin, username, password, &now) {
+                UpsertOutcome::Added => report.added += 1,
+                UpsertOutcome::Updated => report.updated += 1,
+                UpsertOutcome::Skipped => report.skipped += 1,
+            }
+        }
+
+        if report.added > 0 || report.updated > 0 {
+            self.save();
+        }
+        self.last_import_notice = Some(format!(
+            "Chrome içe aktarma tamamlandı: {} yeni şifre eklendi, {} şifre güncellendi{}.",
+            report.added,
+            report.updated,
+            if report.skipped > 0 {
+                format!(" ({} satır atlandı)", report.skipped)
+            } else {
+                String::new()
+            }
+        ));
+        report
     }
 
     pub fn delete_at(&mut self, idx: usize) {
@@ -187,11 +293,102 @@ impl PasswordManager {
 
     pub fn for_origin(&self, origin: &str) -> Vec<&SavedCredential> {
         let orig = origin.trim().to_lowercase();
+        let orig_bare = orig.strip_prefix("www.").unwrap_or(&orig);
         self.credentials
             .iter()
-            .filter(|c| c.origin == orig)
+            .filter(|c| {
+                let c_bare = c.origin.strip_prefix("www.").unwrap_or(&c.origin);
+                c.origin == orig || (!orig_bare.is_empty() && c_bare == orig_bare)
+            })
             .collect()
     }
+}
+
+fn find_col(headers: &[String], candidates: &[&str]) -> Option<usize> {
+    candidates
+        .iter()
+        .find_map(|c| headers.iter().position(|h| h == c))
+}
+
+fn normalize_chrome_origin(raw_url: &str, raw_name: &str) -> String {
+    let trimmed = raw_url.trim();
+    if let Some(rest) = trimmed.strip_prefix("android://") {
+        // Format: android://<cert_hash>@<package_id>[/]
+        if let Some((_, pkg)) = rest.split_once('@') {
+            let pkg_clean = pkg.trim_matches('/').trim().to_lowercase();
+            if !pkg_clean.is_empty() {
+                return pkg_clean;
+            }
+        }
+    }
+    if !trimmed.is_empty() {
+        let candidate = if trimmed.contains("://") {
+            trimmed.to_string()
+        } else {
+            format!("https://{trimmed}")
+        };
+        if let Ok(parsed) = url::Url::parse(&candidate) {
+            if let Some(host) = parsed.host_str() {
+                let h = host.trim().to_lowercase();
+                if !h.is_empty() {
+                    return h;
+                }
+            }
+        }
+    }
+    raw_name.trim().to_lowercase()
+}
+
+/// Minimal RFC 4180 CSV parser supporting UTF-8 BOM, quoted fields,
+/// escaped quotes (`""`), and embedded newlines.
+fn parse_csv_rows(input: &str) -> Vec<Vec<String>> {
+    let clean = input.strip_prefix('\u{feff}').unwrap_or(input);
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut current_row: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut chars = clean.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(ch);
+            }
+        } else {
+            match ch {
+                '"' if field.is_empty() => {
+                    in_quotes = true;
+                }
+                ',' => {
+                    current_row.push(std::mem::take(&mut field));
+                }
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    current_row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut current_row));
+                }
+                '\n' => {
+                    current_row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut current_row));
+                }
+                other => field.push(other),
+            }
+        }
+    }
+    if !field.is_empty() || !current_row.is_empty() {
+        current_row.push(field);
+        rows.push(current_row);
+    }
+    rows
 }
 
 /// Page script injected into websites to detect login form submission & autofill credentials.
@@ -269,6 +466,36 @@ mod tests {
         assert!(reloaded.is_never_save("bank.local"));
         reloaded.delete_at(0);
         assert!(reloaded.credentials.is_empty());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn imports_chrome_passwords_csv_with_quotes_bom_and_dedup() {
+        let tmp = std::env::temp_dir().join(format!("ab_test_csv_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let mut pm = PasswordManager::load(&tmp);
+        pm.add_or_update("github.com", "alice", "oldpass");
+
+        let csv = "\u{feff}name,url,username,password,note\r\n\
+                   GitHub,https://github.com/login,alice,\"p@ss,with\"\"quotes\",line1\n\
+                   Amazon,https://www.amazon.com/ap/signin,bob@example.com,Hunter2!,\"multi\nline note\"\n\
+                   EmptyPw,https://skip.me,user,,\n\
+                   Android,android://hash123@com.netflix.mediaclient/,carl,Stream99,\n";
+
+        let rep = pm.import_chrome_csv(csv);
+        assert_eq!(rep.added, 2);
+        assert_eq!(rep.updated, 1);
+        assert_eq!(rep.skipped, 1);
+
+        assert_eq!(pm.for_origin("github.com")[0].password, "p@ss,with\"quotes");
+        // www.amazon.com matches bare amazon.com
+        assert_eq!(pm.for_origin("amazon.com").len(), 1);
+        assert_eq!(pm.for_origin("amazon.com")[0].username, "bob@example.com");
+        assert_eq!(pm.for_origin("com.netflix.mediaclient")[0].password, "Stream99");
+
+        // Persisted encrypted to disk
+        let reloaded = PasswordManager::load(&tmp);
+        assert_eq!(reloaded.credentials.len(), 3);
         let _ = fs::remove_dir_all(&tmp);
     }
 }

@@ -101,6 +101,8 @@ struct IpcEnvelope {
     #[serde(default)]
     password: String,
     #[serde(default)]
+    csv_data: String,
+    #[serde(default)]
     idx: Option<usize>,
     #[serde(default)]
     path: String,
@@ -838,6 +840,15 @@ impl BrowserApp {
                 self.close_popover();
                 self.reload_active_internal_if_matching();
                 self.sync_chrome_bar();
+            }
+            "pw_import_csv" => {
+                self.passwords.import_chrome_csv(&env.csv_data);
+                self.reload_active_internal_if_matching();
+                self.sync_chrome_bar();
+            }
+            "pw_clear_notice" => {
+                self.passwords.last_import_notice = None;
+                self.reload_active_internal_if_matching();
             }
             "pw_never_save" => {
                 self.passwords.mark_never_save(&env.origin);

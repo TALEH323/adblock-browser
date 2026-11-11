@@ -339,8 +339,8 @@ fn render_passwords(_storage: &BrowserStorage, pw: &PasswordManager) -> String {
                   <div class="row-sub">Kullanıcı: {} • Güncelleme: {}</div>
                 </div>
                 <div class="actions">
-                  <span id="pw-{idx}" style="font-family:monospace; color:#9aa0a6; font-size:12.5px;">••••••••</span>
-                  <button class="btn" onclick="const el=document.getElementById('pw-{idx}'); el.textContent = el.textContent==='••••••••' ? '{}' : '••••••••';">Göster</button>
+                  <span id="pw-{idx}" data-pw="{}" style="font-family:monospace; color:#9aa0a6; font-size:12.5px;">••••••••</span>
+                  <button class="btn" onclick="const el=document.getElementById('pw-{idx}'); const shown=el.dataset.shown==='1'; el.textContent=shown ? '••••••••' : el.dataset.pw; el.dataset.shown=shown ? '0' : '1'; this.textContent=shown ? 'Göster' : 'Gizle';">Göster</button>
                   <button class="btn-danger" onclick="sendCmd('pw_delete', {{idx:{idx}}})">Sil</button>
                 </div>
               </div>"###,
@@ -356,11 +356,49 @@ fn render_passwords(_storage: &BrowserStorage, pw: &PasswordManager) -> String {
         rows = r###"<div class="empty">Kayıtlı şifre bulunmuyor.</div>"###.to_string();
     }
 
+    let import_banner = if let Some(msg) = &pw.last_import_notice {
+        format!(
+            r###"<div class="card" style="border-color:rgba(129,201,149,.35); background:rgba(129,201,149,.09); color:#c8f7d4; font-size:13.5px; display:flex; justify-content:space-between; align-items:center;">
+                <span>{}</span>
+                <button class="btn" onclick="sendCmd('pw_clear_notice')">Tamam</button>
+              </div>"###,
+            txt(msg)
+        )
+    } else {
+        String::new()
+    };
+
     let body = format!(
         r###"
         <div class="header-row">
           <h1>Şifre Yöneticisi (AES-256-GCM Şifreli)</h1>
           <input class="search-input" type="text" placeholder="Site veya kullanıcı ara..." oninput="filterRows(this.value)">
+        </div>
+        {import_banner}
+        <div class="card">
+          <div class="card-title">Google Chrome'dan Şifre İçe Aktar (.csv)</div>
+          <p style="font-size:12.5px; color:#9aa0a6; margin-bottom:12px; line-height:1.5;">
+            Chrome'da <code style="background:rgba(255,255,255,.08); padding:2px 6px; border-radius:5px; color:#e8eaed;">chrome://password-manager/settings</code> &rarr; <strong>Şifreleri dışa aktar</strong> adımından aldığınız <code>.csv</code> dosyasını seçin veya buraya sürükleyin. Tüm şifreler AES-256-GCM kasasına şifrelenerek eklenir.
+          </p>
+          <div id="chrome-dropzone" style="border:1.5px dashed rgba(138,180,248,.38); border-radius:12px; padding:18px; text-align:center; background:rgba(138,180,248,.05); cursor:pointer;"
+               onclick="document.getElementById('chrome-csv-input').click();"
+               ondragover="event.preventDefault(); this.style.borderColor='#8ab4f8'; this.style.background='rgba(138,180,248,.12)';"
+               ondragleave="this.style.borderColor='rgba(138,180,248,.38)'; this.style.background='rgba(138,180,248,.05)';"
+               ondrop="event.preventDefault(); this.style.borderColor='rgba(138,180,248,.38)'; if(event.dataTransfer.files[0]) window.__importChromeCsvFile(event.dataTransfer.files[0]);">
+            <input id="chrome-csv-input" type="file" accept=".csv,text/csv" style="display:none;" onchange="if(this.files[0]) window.__importChromeCsvFile(this.files[0]);">
+            <div style="font-size:13.5px; font-weight:600; color:#e8eaed; margin-bottom:4px;">Chrome Şifreleri (.csv) Dosyası Seç veya Sürükle</div>
+            <div style="font-size:12px; color:#9aa0a6;">Desteklenen biçim: Google Chrome / Brave / Edge Passwords CSV</div>
+          </div>
+          <script>
+            window.__importChromeCsvFile = (file) => {{
+              if (!file) return;
+              const reader = new FileReader();
+              reader.onload = () => {{
+                sendCmd('pw_import_csv', {{ csv_data: String(reader.result || '') }});
+              }};
+              reader.readAsText(file, 'UTF-8');
+            }};
+          </script>
         </div>
         <div class="card">
           <div class="card-title">Yeni Şifre Ekle</div>

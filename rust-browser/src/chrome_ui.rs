@@ -699,12 +699,19 @@ pub fn render_popover_html(kind: PopoverKind<'_>) -> (String, u32, u32) {
                   <div class="scroll">{body}</div>
                   <div class="sep"></div>
                   <button class="menu-row" onclick="popCmd('open_internal', {{route:'passwords'}})">
+                    <div class="mr-txt">
+                      <div class="mr-t">Chrome'dan İçe Aktar (.csv)</div>
+                      <div class="mr-s">Google Chrome şifrelerini aktar</div>
+                    </div>
+                    <span>⇣</span>
+                  </button>
+                  <button class="menu-row" onclick="popCmd('open_internal', {{route:'passwords'}})">
                     <div class="mr-txt"><div class="mr-t">Şifre Yöneticisini Aç</div></div>
                     <span>↗</span>
                   </button>
                 </div></body></html>"###
             );
-            (html, 345, 310)
+            (html, 345, 355)
         }
         PopoverKind::Menu { show_bookmarks_bar } => {
             let bm_label = if show_bookmarks_bar {
