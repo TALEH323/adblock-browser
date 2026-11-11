@@ -17,6 +17,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test
       - run: cmd /c scripts\build_windows.bat
+      - name: Build Windows Installer (Inno Setup 6)
+        shell: pwsh
+        run: |
+          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          if (-not $iscc -and (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          }
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc "installer\windows\AdBlockBrowser.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AdBlockBrowser-Windows-Setup
+          path: rust-browser/dist/installer/AdBlockBrowser-Setup-0.1.0-x64.exe
       - uses: actions/upload-artifact@v4
         with:
           name: AdBlockBrowser-Windows
@@ -32,6 +49,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test
       - run: bash scripts/build_macos.sh
+      - name: Build styled macOS DMG installer
+        run: bash scripts/build_dmg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AdBlockBrowser-macOS-DMG
+          path: rust-browser/dist/AdBlockBrowser-0.1.0-macOS.dmg
       - uses: actions/upload-artifact@v4
         with:
           name: AdBlockBrowser-macOS

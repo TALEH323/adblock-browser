@@ -33,6 +33,7 @@ jobs:
             --clean `
             --windowed `
             --onedir `
+            --icon "rust-browser\assets\app.ico" `
             --name "AdBlockTarayici" `
             --hidden-import PyQt6.QtWebEngineCore `
             --hidden-import PyQt6.QtWebEngineWidgets `
@@ -40,12 +41,32 @@ jobs:
             --hidden-import PyQt6.QtSvg `
             main.py
 
+      - name: Build Windows Installer (Inno Setup 6)
+        shell: pwsh
+        run: |
+          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          if (-not $iscc -and (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          }
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc "installer\windows\AdBlockTarayici.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Package Windows build as ZIP
         shell: pwsh
         run: |
           Compress-Archive -Path dist\AdBlockTarayici\* -DestinationPath AdBlockTarayici-Windows-x64.zip
 
-      - name: Upload Windows artifact
+      - name: Upload Windows Setup Installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdBlockTarayici-Windows-Setup
+          path: dist/installer/AdBlockTarayici-Setup-0.1.0-x64.exe
+
+      - name: Upload Windows ZIP artifact
         uses: actions/upload-artifact@v4
         with:
           name: AdBlockTarayici-Windows-x64
