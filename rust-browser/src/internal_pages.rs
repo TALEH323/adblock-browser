@@ -11,6 +11,7 @@ const NAV_ITEMS: &[(&str, &str, &str)] = &[
     ("history", "Geçmiş", "<circle cx='12' cy='12' r='10'/><polyline points='12 6 12 12 16 14'/>"),
     ("bookmarks", "Yer İmleri", "<polygon points='12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2'/>"),
     ("adblock", "AdBlock Yönetimi", "<path d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/>"),
+    ("updates", "Sürüm Geçmişi", "<circle cx='12' cy='12' r='10'/><path d='M12 16v-4'/><path d='M12 8h.01'/>"),
 ];
 
 fn wrap_shell(active: &str, title: &str, body_html: &str) -> String {
@@ -171,6 +172,7 @@ pub fn render_route(
         "history" => render_history(storage),
         "bookmarks" => render_bookmarks(storage),
         "adblock" => render_adblock(ab),
+        "updates" => render_updates(),
         _ => render_home(storage, ab),
     }
 }
@@ -563,6 +565,48 @@ fn render_adblock(ab: &AdBlockService) -> String {
     wrap_shell("adblock", "AdBlock Yönetimi — AdBlock Tarayıcı", &body)
 }
 
+fn render_updates() -> String {
+    let entries = crate::updater::built_in_changelog();
+    let mut cards = String::new();
+    for (idx, e) in entries.iter().enumerate() {
+        let mut lis = String::new();
+        for ch in &e.changes {
+            lis.push_str(&format!(
+                "<li style='margin:6px 0; color:#d5dce6; font-size:13px; line-height:1.45;'>{}</li>",
+                txt(ch)
+            ));
+        }
+        let badge = if idx == 0 {
+            "<span class='pill' style='background:rgba(129,201,149,.16); color:#81c995;'>Mevcut Sürüm</span>"
+        } else {
+            ""
+        };
+        cards.push_str(&format!(
+            r###"<div class="card">
+              <div class="row" style="justify-content:space-between;">
+                <div style="font-size:15px; font-weight:600;">v{} — {}</div>
+                <div style="display:flex; gap:8px; align-items:center;">{badge}<span style="color:#9aa0a6; font-size:12px;">{}</span></div>
+              </div>
+              <ul style="padding:10px 28px 14px; margin:0;">{lis}</ul>
+            </div>"###,
+            txt(&e.version),
+            txt(&e.title),
+            txt(&e.date)
+        ));
+    }
+
+    let body = format!(
+        r###"
+        <div class="header-row">
+          <h1>Sürüm Kaydı &amp; Değişiklikler (v{})</h1>
+        </div>
+        {cards}
+        "###,
+        txt(crate::updater::APP_VERSION)
+    );
+    wrap_shell("updates", "Sürüm Geçmişi — AdBlock Tarayıcı", &body)
+}
+
 pub fn render_security_interstitial(host: &str, target_url: &str, reason: &str) -> String {
     format!(
         r###"<!DOCTYPE html>
@@ -613,6 +657,7 @@ mod tests {
             "history",
             "bookmarks",
             "adblock",
+            "updates",
         ] {
             let html = render_route(route, &storage, &ab, &pw);
             assert!(html.contains("AdBlock Tarayıcı"), "route {route} failed");

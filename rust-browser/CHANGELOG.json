@@ -1,0 +1,16 @@
+[
+  {
+    "version": "0.1.0",
+    "date": "2026-11-12",
+    "title": "İlk Saf Rust Sürümü",
+    "tag": "Mevcut",
+    "changes": [
+      "Python/PyQt6 bağımlılığı tamamen kaldırılarak saf Rust (tao + wry + adblock-rust) mimarisine geçildi.",
+      "Chrome Material You koyu arayüz, dinamik sekme çubuğu, yan panel ve açılır baloncuklar eklendi.",
+      "Yerel güvenlik proxy'si, Brave AdBlock motoru, kozmetik/YouTube reklam temizleyici ve Cloudflare DoH (1.1.1.2) DNS Koruması eklendi.",
+      "AES-256-GCM + PBKDF2 şifreli kasa ve Google Chrome (.csv) şifre içe aktarma özelliği eklendi.",
+      "Windows için Inno Setup 6 kurulum sihirbazı (.exe) ve macOS için özel tasarımlı Retina DMG paketi hazırlandı.",
+      "Dahili sürüm kaydı, otomatik sürüm kontrolü ve güncelleme destekli yeni Başlatıcı (Launcher) eklendi."
+    ]
+  }
+]

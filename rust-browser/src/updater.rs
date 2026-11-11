@@ -1,6 +1,6 @@
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -9,6 +9,42 @@ use std::time::Duration;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_GITHUB_REPO: &str = "TALEH323/adblock-browser";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangelogEntry {
+    pub version: String,
+    pub date: String,
+    pub title: String,
+    #[serde(default)]
+    pub tag: String,
+    #[serde(default)]
+    pub changes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteCommitItem {
+    pub sha: String,
+    pub message: String,
+    pub date: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteReleaseItem {
+    pub version: String,
+    pub date: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LauncherProfileStats {
+    pub blocked_total: u64,
+    pub password_count: usize,
+    pub bookmark_count: usize,
+}
+
+pub fn built_in_changelog() -> Vec<ChangelogEntry> {
+    serde_json::from_str(include_str!("../CHANGELOG.json")).unwrap_or_default()
+}
 
 #[derive(Debug, Clone)]
 pub struct ReleaseInfo {
@@ -27,6 +63,13 @@ pub enum UpdateCheckResult {
     UpToDate { current: String, latest: String },
     UpdateAvailable(ReleaseInfo),
     Unavailable { current: String, reason: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateCheckBundle {
+    pub result: UpdateCheckResult,
+    pub remote_releases: Vec<RemoteReleaseItem>,
+    pub remote_commits: Vec<RemoteCommitItem>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,8 +105,17 @@ pub fn is_newer_version(candidate: &str, current: &str) -> bool {
     normalize_version(candidate) > normalize_version(current)
 }
 
-pub fn check_for_updates(manifest_url: &str, token: &str) -> UpdateCheckResult {
+fn effective_token(token: &str) -> String {
+    if !token.trim().is_empty() {
+        token.trim().to_string()
+    } else {
+        std::env::var("ADBLOCK_UPDATE_TOKEN").unwrap_or_default()
+    }
+}
+
+pub fn check_for_updates_bundle(manifest_url: &str, token: &str) -> UpdateCheckBundle {
     let current = APP_VERSION.to_string();
+    let eff_token = effective_token(token);
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(4))
         .timeout_read(Duration::from_secs(6))
@@ -75,10 +127,10 @@ pub fn check_for_updates(manifest_url: &str, token: &str) -> UpdateCheckResult {
             .get(custom_url)
             .set("User-Agent", &format!("AdBlockBrowser/{current}"))
             .set("Accept", "application/json");
-        if !token.trim().is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", token.trim()));
+        if !eff_token.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {eff_token}"));
         }
-        return match req.call() {
+        let result = match req.call() {
             Ok(resp) => match resp.into_string() {
                 Ok(body) => parse_custom_manifest(&body, &current),
                 Err(e) => UpdateCheckResult::Unavailable {
@@ -91,6 +143,11 @@ pub fn check_for_updates(manifest_url: &str, token: &str) -> UpdateCheckResult {
                 reason: format!("Sunucuya erişilemedi ({e})"),
             },
         };
+        return UpdateCheckBundle {
+            result,
+            remote_releases: Vec::new(),
+            remote_commits: Vec::new(),
+        };
     }
 
     let api_url = format!("https://api.github.com/repos/{DEFAULT_GITHUB_REPO}/releases/latest");
@@ -98,36 +155,137 @@ pub fn check_for_updates(manifest_url: &str, token: &str) -> UpdateCheckResult {
         .get(&api_url)
         .set("User-Agent", &format!("AdBlockBrowser/{current}"))
         .set("Accept", "application/vnd.github+json");
-    let eff_token = if !token.trim().is_empty() {
-        token.trim().to_string()
-    } else {
-        std::env::var("ADBLOCK_UPDATE_TOKEN").unwrap_or_default()
-    };
     if !eff_token.is_empty() {
         req = req.set("Authorization", &format!("Bearer {eff_token}"));
     }
 
-    match req.call() {
+    let result = match req.call() {
         Ok(resp) => match resp.into_string() {
             Ok(body) => parse_github_release(&body, &current),
             Err(e) => UpdateCheckResult::Unavailable {
-                current,
+                current: current.clone(),
                 reason: format!("Yanıt okunamadı: {e}"),
             },
         },
         Err(ureq::Error::Status(404, _)) => UpdateCheckResult::Unavailable {
-            current,
-            reason: "Yayınlanmış sürüm bulunamadı (veya repo özel).".to_string(),
+            current: current.clone(),
+            reason: if eff_token.is_empty() {
+                "Henüz yayınlanmış GitHub Release yok veya repo özel (Token gerekebilir).".to_string()
+            } else {
+                "Henüz yayınlanmış bir GitHub Release (etiketli sürüm) yok.".to_string()
+            },
+        },
+        Err(ureq::Error::Status(401 | 403, _)) => UpdateCheckResult::Unavailable {
+            current: current.clone(),
+            reason: "Yetkilendirme veya hız limiti hatası — Ayarlardan Token kontrol edin.".to_string(),
         },
         Err(ureq::Error::Status(code, _)) => UpdateCheckResult::Unavailable {
-            current,
+            current: current.clone(),
             reason: format!("Sürüm sunucusu yanıtı: HTTP {code}"),
         },
         Err(_) => UpdateCheckResult::Unavailable {
-            current,
-            reason: "Sürüm sunucusuna erişilemedi (çevrimdışı).".to_string(),
+            current: current.clone(),
+            reason: "Sürüm sunucusuna erişilemedi (çevrimdışı mod).".to_string(),
         },
+    };
+
+    let remote_releases = fetch_github_releases(&agent, &eff_token, &current);
+    let remote_commits = fetch_github_commits(&agent, &eff_token, &current);
+
+    UpdateCheckBundle {
+        result,
+        remote_releases,
+        remote_commits,
     }
+}
+
+fn fetch_github_releases(
+    agent: &ureq::Agent,
+    token: &str,
+    current: &str,
+) -> Vec<RemoteReleaseItem> {
+    let url = format!("https://api.github.com/repos/{DEFAULT_GITHUB_REPO}/releases?per_page=8");
+    let mut req = agent
+        .get(&url)
+        .set("User-Agent", &format!("AdBlockBrowser/{current}"))
+        .set("Accept", "application/vnd.github+json");
+    if !token.is_empty() {
+        req = req.set("Authorization", &format!("Bearer {token}"));
+    }
+    let Ok(resp) = req.call() else {
+        return Vec::new();
+    };
+    let Ok(body) = resp.into_string() else {
+        return Vec::new();
+    };
+    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&body) else {
+        return Vec::new();
+    };
+    arr.into_iter()
+        .filter_map(|v| {
+            let tag = v.get("tag_name")?.as_str()?.trim().trim_start_matches(['v', 'V']).to_string();
+            let date = v
+                .get("published_at")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .chars()
+                .take(10)
+                .collect();
+            let notes = v
+                .get("body")
+                .and_then(|b| b.as_str())
+                .unwrap_or("")
+                .chars()
+                .take(300)
+                .collect();
+            Some(RemoteReleaseItem {
+                version: tag,
+                date,
+                notes,
+            })
+        })
+        .collect()
+}
+
+fn fetch_github_commits(
+    agent: &ureq::Agent,
+    token: &str,
+    current: &str,
+) -> Vec<RemoteCommitItem> {
+    let url = format!("https://api.github.com/repos/{DEFAULT_GITHUB_REPO}/commits?per_page=8");
+    let mut req = agent
+        .get(&url)
+        .set("User-Agent", &format!("AdBlockBrowser/{current}"))
+        .set("Accept", "application/vnd.github+json");
+    if !token.is_empty() {
+        req = req.set("Authorization", &format!("Bearer {token}"));
+    }
+    let Ok(resp) = req.call() else {
+        return Vec::new();
+    };
+    let Ok(body) = resp.into_string() else {
+        return Vec::new();
+    };
+    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&body) else {
+        return Vec::new();
+    };
+    arr.into_iter()
+        .filter_map(|v| {
+            let sha = v.get("sha")?.as_str()?.chars().take(7).collect::<String>();
+            let msg_full = v.get("commit")?.get("message")?.as_str()?;
+            let message = msg_full.lines().next().unwrap_or("").trim().to_string();
+            let date = v
+                .get("commit")?
+                .get("author")?
+                .get("date")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .chars()
+                .take(10)
+                .collect();
+            Some(RemoteCommitItem { sha, message, date })
+        })
+        .collect()
 }
 
 pub fn parse_custom_manifest(json_str: &str, current: &str) -> UpdateCheckResult {
@@ -295,12 +453,7 @@ where
         .clone()
         .unwrap_or_else(|| format!("AdBlockBrowser-Update-{}", info.version));
     let dest_path = std::env::temp_dir().join(&file_name);
-
-    let eff_token = if !token.trim().is_empty() {
-        token.trim().to_string()
-    } else {
-        std::env::var("ADBLOCK_UPDATE_TOKEN").unwrap_or_default()
-    };
+    let eff_token = effective_token(token);
 
     on_progress(5, "Güncelleme dosyasına bağlanılıyor...");
     let resp = if !eff_token.is_empty() {
@@ -436,7 +589,6 @@ fn apply_downloaded_package(pkg_path: &Path) -> Result<bool, String> {
 
 #[cfg(target_os = "macos")]
 fn try_install_macos_dmg(dmg_path: &Path) -> Result<bool, String> {
-    // Only replace cleanly when running inside an installed `.app` bundle.
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let current_app = exe
         .ancestors()
@@ -500,15 +652,21 @@ fn try_install_macos_dmg(dmg_path: &Path) -> Result<bool, String> {
     Ok(installed)
 }
 
-pub fn launcher_html(auto_launch_if_current: bool, manifest_url: &str, has_token: bool) -> String {
+pub fn launcher_html(
+    auto_launch_if_current: bool,
+    manifest_url: &str,
+    has_token: bool,
+    stats: &LauncherProfileStats,
+) -> String {
     let icon_b64 = B64.encode(include_bytes!("../assets/icon.png"));
     let checked_attr = if auto_launch_if_current { "checked" } else { "" };
     let manifest_esc = html_escape::encode_double_quoted_attribute(manifest_url);
     let token_ph = if has_token {
-        "•••••••• (Kayıtlı token)"
+        "•••••••• (Kayıtlı token mevcut — değiştirmek için yazın)"
     } else {
-        "GitHub Token (özel repo için isteğe bağlı)"
+        "github_pat_... (Özel repo Release ve commit erişimi için)"
     };
+    let changelog_json = serde_json::to_string(&built_in_changelog()).unwrap_or_else(|_| "[]".into());
 
     format!(
         r###"<!DOCTYPE html>
@@ -516,160 +674,336 @@ pub fn launcher_html(auto_launch_if_current: bool, manifest_url: &str, has_token
 <head>
 <meta charset="utf-8">
 <style>
+  :root {{
+    color-scheme: dark;
+    --bg: #0b0f17;
+    --rail: #0f141e;
+    --pane: #131924;
+    --card: rgba(255,255,255,0.038);
+    --card-border: rgba(255,255,255,0.08);
+    --text: #eef2f7;
+    --sub: #8b98ac;
+    --blue: #8ab4f8;
+    --green: #81c995;
+    --amber: #fdd663;
+  }}
   * {{ box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }}
   html, body {{
     width: 100%; height: 100%; overflow: hidden;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    color: #f1f5f9;
-    background: radial-gradient(circle at 22% 18%, rgba(74, 168, 255, 0.16), transparent 45%),
-                radial-gradient(circle at 82% 78%, rgba(78, 224, 164, 0.14), transparent 48%),
-                linear-gradient(155deg, #10151f 0%, #0b0f17 100%);
+    background: var(--bg); color: var(--text);
   }}
-  .wrap {{
-    height: 100%; display: flex; flex-direction: column; justify-content: space-between;
-    padding: 28px 30px 22px;
+  .shell {{
+    width: 100%; height: 100%; display: flex;
+    background: var(--pane);
+    border: 1px solid rgba(255,255,255,0.09);
   }}
-  .top {{ display: flex; align-items: center; gap: 16px; }}
-  .logo {{
-    width: 64px; height: 64px; border-radius: 16px;
-    filter: drop-shadow(0 8px 20px rgba(74, 174, 255, 0.28));
+  /* Left Studio Rail */
+  .rail {{
+    width: 236px; flex-shrink: 0;
+    background: var(--rail);
+    border-right: 1px solid rgba(255,255,255,0.07);
+    display: flex; flex-direction: column; justify-content: space-between;
+    padding: 18px 14px 16px;
   }}
-  .brand h1 {{ font-size: 20px; font-weight: 700; letter-spacing: -0.2px; }}
-  .brand .ver {{
-    margin-top: 4px; display: inline-flex; align-items: center; gap: 8px;
-    font-size: 12px; color: #9aa7ba;
+  .brand {{
+    display: flex; align-items: center; gap: 11px; padding: 4px 6px 14px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
   }}
-  .pill {{
-    padding: 2px 9px; border-radius: 999px; font-weight: 600; font-size: 11px;
-    background: rgba(138, 180, 248, 0.15); color: #9ec5ff;
-    border: 1px solid rgba(138, 180, 248, 0.28);
+  .brand img {{ width: 40px; height: 40px; border-radius: 10px; }}
+  .brand-t {{ font-size: 14.5px; font-weight: 700; letter-spacing: -0.2px; }}
+  .brand-v {{
+    display: inline-block; margin-top: 3px; font-size: 11px; font-family: ui-monospace, monospace;
+    color: var(--blue); background: rgba(138,180,248,0.12);
+    border: 1px solid rgba(138,180,248,0.22); border-radius: 6px; padding: 1px 7px;
   }}
-  .gear-btn {{
-    margin-left: auto; width: 32px; height: 32px; border-radius: 9px; border: 1px solid rgba(255,255,255,.1);
-    background: rgba(255,255,255,.05); color: #9aa7ba; cursor: pointer; font-size: 15px;
-    display: flex; align-items: center; justify-content: center;
+  .nav {{ display: flex; flex-direction: column; gap: 4px; margin-top: 14px; }}
+  .nav-btn {{
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 11px; border-radius: 9px; border: none;
+    background: transparent; color: var(--sub); font-size: 12.8px; font-weight: 500;
+    cursor: pointer; text-align: left; transition: background .12s, color .12s;
   }}
-  .gear-btn:hover {{ background: rgba(255,255,255,.12); color: #fff; }}
+  .nav-btn svg {{ width: 15px; height: 15px; flex-shrink: 0; opacity: 0.85; }}
+  .nav-btn:hover {{ background: rgba(255,255,255,0.05); color: var(--text); }}
+  .nav-btn.active {{ background: rgba(138,180,248,0.14); color: #d2e3fc; font-weight: 600; }}
+
+  .stats-box {{
+    margin-top: auto; margin-bottom: 12px;
+    background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 11px; padding: 11px 12px;
+    display: flex; flex-direction: column; gap: 7px;
+  }}
+  .stat-row {{ display: flex; justify-content: space-between; font-size: 11.8px; }}
+  .stat-k {{ color: var(--sub); }}
+  .stat-v {{ font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }}
+  .rail-foot {{ font-size: 11px; color: #5e6b80; padding: 0 4px; }}
+
+  /* Right Main Workspace */
+  .main {{ flex: 1; display: flex; flex-direction: column; min-width: 0; }}
+  .titlebar {{
+    height: 42px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 12px 0 22px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    cursor: grab;
+  }}
+  .titlebar:active {{ cursor: grabbing; }}
+  .tb-title {{ font-size: 12.5px; font-weight: 600; color: var(--sub); }}
+  .win-ctrls {{ display: flex; gap: 6px; }}
+  .win-btn {{
+    width: 26px; height: 26px; border-radius: 7px; border: none;
+    background: rgba(255,255,255,0.04); color: var(--sub); font-size: 14px;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+  }}
+  .win-btn:hover {{ background: rgba(255,255,255,0.12); color: var(--text); }}
+  .win-btn.close:hover {{ background: rgba(242,139,130,0.22); color: #f28b82; }}
+
+  .content {{ flex: 1; overflow-y: auto; padding: 20px 22px 14px; display: flex; flex-direction: column; gap: 14px; }}
+  .content::-webkit-scrollbar {{ width: 6px; }}
+  .content::-webkit-scrollbar-thumb {{ background: rgba(255,255,255,0.12); border-radius: 3px; }}
+  .tab-pane {{ display: none; flex-direction: column; gap: 14px; }}
+  .tab-pane.active {{ display: flex; }}
 
   .card {{
-    background: rgba(255, 255, 255, 0.045);
-    border: 1px solid rgba(255, 255, 255, 0.09);
-    border-radius: 16px; padding: 16px 18px;
-    display: flex; flex-direction: column; gap: 10px;
+    background: var(--card); border: 1px solid var(--card-border);
+    border-radius: 13px; padding: 15px 17px;
+    display: flex; flex-direction: column; gap: 9px;
   }}
-  .status-row {{ display: flex; align-items: center; gap: 10px; font-size: 13.5px; font-weight: 600; }}
-  .dot {{
-    width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
-    background: #8ab4f8; box-shadow: 0 0 10px rgba(138, 180, 248, 0.8);
-    animation: pulse 1.2s infinite ease-in-out;
-  }}
-  .dot.ok {{ background: #52e0a1; box-shadow: 0 0 10px rgba(82, 224, 161, 0.7); animation: none; }}
-  .dot.upd {{ background: #60a5fa; box-shadow: 0 0 12px rgba(96, 165, 250, 0.9); animation: none; }}
-  .dot.warn {{ background: #fbbf24; box-shadow: 0 0 8px rgba(251, 191, 36, 0.5); animation: none; }}
-  @keyframes pulse {{ 0%, 100% {{ opacity: .45; transform: scale(.9); }} 50% {{ opacity: 1; transform: scale(1.1); }} }}
+  .card-hdr {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; }}
+  .card-title {{ font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--sub); font-weight: 600; }}
+  .status-line {{ display: flex; align-items: center; gap: 10px; font-size: 14.5px; font-weight: 600; }}
+  .dot {{ width: 9px; height: 9px; border-radius: 50%; background: var(--blue); flex-shrink: 0; }}
+  .dot.spin {{ animation: pulse 1.1s infinite; }}
+  .dot.ok {{ background: var(--green); }}
+  .dot.upd {{ background: var(--blue); box-shadow: 0 0 10px rgba(138,180,248,0.65); }}
+  .dot.warn {{ background: var(--amber); }}
+  @keyframes pulse {{ 0%, 100% {{ opacity: .35; }} 50% {{ opacity: 1; }} }}
 
-  .sub-msg {{ font-size: 12.2px; color: #9aa7ba; line-height: 1.45; max-height: 74px; overflow-y: auto; }}
-  .bar-bg {{
-    width: 100%; height: 6px; border-radius: 999px;
-    background: rgba(255,255,255,0.08); overflow: hidden;
-  }}
-  .bar-fill {{
-    height: 100%; width: 22%; border-radius: 999px;
-    background: linear-gradient(90deg, #56b2ff, #52e0a1);
-    transition: width .22s ease;
-  }}
-  .bar-fill.indet {{ width: 35%; animation: slide 1.1s infinite ease-in-out; }}
+  .muted {{ font-size: 12.5px; color: var(--sub); line-height: 1.5; }}
+  .prog-wrap {{ display: none; flex-direction: column; gap: 6px; margin-top: 2px; }}
+  .prog-wrap.show {{ display: flex; }}
+  .bar-bg {{ width: 100%; height: 5px; border-radius: 999px; background: rgba(255,255,255,0.08); overflow: hidden; }}
+  .bar-fill {{ height: 100%; width: 25%; background: var(--blue); border-radius: 999px; transition: width .2s; }}
+  .bar-fill.indet {{ width: 35%; animation: slide 1s infinite ease-in-out; }}
   @keyframes slide {{ 0% {{ transform: translateX(-110%); }} 100% {{ transform: translateX(300%); }} }}
 
-  .cfg {{
-    display: none; flex-direction: column; gap: 8px;
-    background: rgba(0,0,0,0.28); border: 1px solid rgba(255,255,255,.08);
-    border-radius: 12px; padding: 11px 13px;
+  .badge {{
+    font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+    background: rgba(255,255,255,0.07); color: var(--sub);
   }}
-  .cfg.open {{ display: flex; }}
-  .cfg input {{
-    width: 100%; padding: 7px 10px; border-radius: 8px; font-size: 12px;
-    background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12);
-    color: #f1f5f9; outline: none; user-select: text; -webkit-user-select: text;
-  }}
-  .cfg-row {{ display: flex; justify-content: flex-end; gap: 8px; }}
+  .badge.ok {{ background: rgba(129,201,149,0.14); color: var(--green); }}
+  .badge.upd {{ background: rgba(138,180,248,0.16); color: var(--blue); }}
 
-  .bottom {{ display: flex; flex-direction: column; gap: 12px; }}
-  .actions {{ display: flex; gap: 10px; align-items: center; }}
+  .cl-list {{ list-style: none; display: flex; flex-direction: column; gap: 6px; }}
+  .cl-list li {{ font-size: 12.5px; color: #c9d2e0; padding-left: 14px; position: relative; line-height: 1.4; }}
+  .cl-list li::before {{ content: "•"; position: absolute; left: 2px; color: var(--blue); }}
+
+  .commit-row {{
+    display: flex; align-items: baseline; gap: 9px; font-size: 12.3px;
+    padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);
+  }}
+  .commit-row:last-child {{ border-bottom: none; }}
+  .sha {{ font-family: ui-monospace, monospace; font-size: 11px; color: var(--blue); flex-shrink: 0; }}
+  .cmsg {{ flex: 1; color: #d5dce6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .cdate {{ font-size: 11px; color: var(--sub); flex-shrink: 0; }}
+
+  .field {{ display: flex; flex-direction: column; gap: 5px; }}
+  .field label {{ font-size: 12px; color: var(--sub); }}
+  .field input {{
+    padding: 9px 11px; border-radius: 9px; font-size: 12.5px;
+    background: rgba(0,0,0,0.28); border: 1px solid rgba(255,255,255,0.11);
+    color: var(--text); outline: none; user-select: text; -webkit-user-select: text;
+  }}
+  .field input:focus {{ border-color: var(--blue); }}
+
+  .code-box {{
+    font-family: ui-monospace, monospace; font-size: 11.2px; color: #b7c6db;
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 9px; padding: 9px 11px; line-height: 1.5; user-select: text; -webkit-user-select: text;
+  }}
+
+  /* Footer Bar */
+  .footer {{
+    padding: 12px 22px 16px;
+    border-top: 1px solid rgba(255,255,255,0.07);
+    background: rgba(0,0,0,0.16);
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  }}
+  .auto-lbl {{ display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--sub); cursor: pointer; }}
+  .auto-lbl input {{ accent-color: var(--blue); width: 14px; height: 14px; }}
+  .btn-group {{ display: flex; gap: 8px; align-items: center; }}
   .btn {{
-    border: none; border-radius: 12px; padding: 11px 16px; font-size: 13.5px; font-weight: 600;
-    cursor: pointer; transition: transform .08s ease, opacity .15s ease;
+    border: none; border-radius: 9px; padding: 9px 15px; font-size: 12.8px; font-weight: 600;
+    cursor: pointer; transition: background .12s, transform .08s, opacity .15s;
   }}
   .btn:active {{ transform: scale(0.98); }}
   .btn:disabled {{ opacity: 0.45; cursor: not-allowed; }}
-  .btn-primary {{
-    flex: 1; color: #08121b;
-    background: linear-gradient(135deg, #6bbdff 0%, #5ce2ab 100%);
-    box-shadow: 0 6px 20px rgba(92, 226, 171, 0.22);
+  .btn-ghost {{ background: rgba(255,255,255,0.06); color: #dce3ee; border: 1px solid rgba(255,255,255,0.09); }}
+  .btn-ghost:hover:not(:disabled) {{ background: rgba(255,255,255,0.11); }}
+  .btn-primary {{ background: #8ab4f8; color: #0a1424; }}
+  .btn-primary:hover:not(:disabled) {{ background: #a3c5fa; }}
+  .btn-green {{ background: #81c995; color: #081c10; }}
+  .btn-link {{
+    background: none; border: none; color: var(--blue); font-size: 12px; font-weight: 600;
+    cursor: pointer; padding: 0;
   }}
-  .btn-secondary {{
-    background: rgba(255,255,255,.08); color: #e2e8f0;
-    border: 1px solid rgba(255,255,255,.1);
-  }}
-  .btn-secondary:hover {{ background: rgba(255,255,255,.14); }}
-  .btn-sm {{ padding: 6px 12px; font-size: 12px; border-radius: 8px; }}
-
-  .opt-row {{
-    display: flex; align-items: center; justify-content: space-between;
-    font-size: 12px; color: #8c9bb0;
-  }}
-  .opt-row label {{ display: inline-flex; align-items: center; gap: 7px; cursor: pointer; }}
-  .opt-row input[type="checkbox"] {{ accent-color: #5ce2ab; width: 14px; height: 14px; }}
+  .btn-link:hover {{ text-decoration: underline; }}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="top">
-    <img class="logo" src="data:image/png;base64,{icon_b64}" alt="Logo">
-    <div class="brand">
-      <h1>AdBlock Tarayıcı</h1>
-      <div class="ver">
-        <span class="pill">v{APP_VERSION}</span>
-        <span>Başlatıcı ve Sürüm Yöneticisi</span>
+<div class="shell">
+  <aside class="rail">
+    <div>
+      <div class="brand">
+        <img src="data:image/png;base64,{icon_b64}" alt="Logo">
+        <div>
+          <div class="brand-t">AdBlock Tarayıcı</div>
+          <span class="brand-v">v{APP_VERSION}</span>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-btn active" data-tab="overview" onclick="switchTab('overview')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+          Genel Bakış
+        </button>
+        <button class="nav-btn" data-tab="changelog" onclick="switchTab('changelog')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4l3 3"/><circle cx="12" cy="12" r="9"/></svg>
+          Sürüm Geçmişi
+        </button>
+        <button class="nav-btn" data-tab="source" onclick="switchTab('source')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.77 1.02 1.41 1.11H21a2 2 0 0 1 0 4h-.09c-.64.09-1.15.51-1.51 1.09z"/></svg>
+          Güncelleme Ayarları
+        </button>
+      </nav>
+    </div>
+
+    <div>
+      <div class="stats-box">
+        <div class="stat-row"><span class="stat-k">Engellenen Reklam</span><span class="stat-v">{blocked}</span></div>
+        <div class="stat-row"><span class="stat-k">Kayıtlı Şifre</span><span class="stat-v">{pws}</span></div>
+        <div class="stat-row"><span class="stat-k">Yer İmleri</span><span class="stat-v">{bms}</span></div>
+      </div>
+      <div class="rail-foot">Rust Native • DoH • AES-256</div>
+    </div>
+  </aside>
+
+  <section class="main">
+    <div class="titlebar" onmousedown="if(event.target.closest('button')==null) sendL('launcher_drag')">
+      <span class="tb-title" id="tb-label">Başlatıcı &amp; Sürüm Kontrolü</span>
+      <div class="win-ctrls">
+        <button class="win-btn" title="Küçült" onclick="sendL('launcher_minimize')">−</button>
+        <button class="win-btn close" title="Kapat" onclick="sendL('launcher_close')">×</button>
       </div>
     </div>
-    <button class="gear-btn" title="Güncelleme Kaynağı Ayarları" onclick="document.getElementById('cfg').classList.toggle('open')">⚙</button>
-  </div>
 
-  <div class="card">
-    <div class="status-row">
-      <div id="dot" class="dot"></div>
-      <div id="st-title">Güncellemeler kontrol ediliyor...</div>
-    </div>
-    <div id="st-sub" class="sub-msg">GitHub Releases üzerinden en güncel sürüm sorgulanıyor.</div>
-    <div class="bar-bg"><div id="bar" class="bar-fill indet"></div></div>
-  </div>
+    <div class="content">
+      <!-- TAB 1: OVERVIEW -->
+      <div id="pane-overview" class="tab-pane active">
+        <div class="card">
+          <div class="card-hdr">
+            <span class="card-title">Sürüm Durumu</span>
+            <span id="st-badge" class="badge">Kontrol Ediliyor</span>
+          </div>
+          <div class="status-line">
+            <div id="dot" class="dot spin"></div>
+            <span id="st-title">Güncellemeler denetleniyor...</span>
+          </div>
+          <div id="st-sub" class="muted">GitHub Releases üzerinden yeni sürüm kontrol ediliyor.</div>
+          <div id="prog-wrap" class="prog-wrap show">
+            <div class="bar-bg"><div id="bar" class="bar-fill indet"></div></div>
+          </div>
+          <div id="st-helper" style="display:none; padding-top:2px;">
+            <button class="btn-link" onclick="switchTab('source')">Özel repo için Token / URL ayarla →</button>
+          </div>
+        </div>
 
-  <div id="cfg" class="cfg">
-    <input id="cfg-url" type="text" value="{manifest_esc}" placeholder="Özel version.json URL (isteğe bağlı)">
-    <input id="cfg-tok" type="password" placeholder="{token_ph}">
-    <div class="cfg-row">
-      <button class="btn btn-secondary btn-sm" onclick="saveUpdateCfg()">Kaydet ve Kontrol Et</button>
-    </div>
-  </div>
+        <div class="card">
+          <div class="card-hdr">
+            <span class="card-title">Bu Sürümdeki Değişiklikler (v{APP_VERSION})</span>
+            <button class="btn-link" onclick="switchTab('changelog')">Tüm Geçmiş →</button>
+          </div>
+          <ul id="latest-cl" class="cl-list"></ul>
+        </div>
+      </div>
 
-  <div class="bottom">
-    <div class="actions">
-      <button id="btn-recheck" class="btn btn-secondary" onclick="sendL('launcher_recheck')">Kontrol Et</button>
-      <button id="btn-update" class="btn btn-primary" style="display:none;" onclick="startUpdate()">Şimdi Güncelle</button>
-      <button id="btn-launch" class="btn btn-primary" onclick="sendL('launcher_launch')">Tarayıcıyı Başlat</button>
+      <!-- TAB 2: CHANGELOG & REMOTE RELEASES -->
+      <div id="pane-changelog" class="tab-pane">
+        <div id="remote-rel-wrap" style="display:none;" class="card">
+          <div class="card-hdr">
+            <span class="card-title">GitHub Yayınlanmış Sürümler (Releases)</span>
+            <span class="badge ok">Canlı</span>
+          </div>
+          <div id="remote-releases" style="display:flex; flex-direction:column; gap:8px;"></div>
+        </div>
+        <div id="remote-cl-wrap" style="display:none;" class="card">
+          <div class="card-hdr">
+            <span class="card-title">GitHub Son Değişiklikler (Commit Geçmişi)</span>
+            <span class="badge ok">Canlı Bağlantı</span>
+          </div>
+          <div id="remote-commits"></div>
+        </div>
+        <div id="builtin-cl-list" style="display:flex; flex-direction:column; gap:10px;"></div>
+      </div>
+
+      <!-- TAB 3: SOURCE & HOW VERSIONING WORKS -->
+      <div id="pane-source" class="tab-pane">
+        <div class="card">
+          <div class="card-title">Güncelleme Kaynağı (GitHub Private / Custom Feed)</div>
+          <div class="field">
+            <label>GitHub Token (Özel depo Release ve Commit geçmişi için isteğe bağlı)</label>
+            <input id="cfg-tok" type="password" placeholder="{token_ph}">
+          </div>
+          <div class="field">
+            <label>Özel version.json URL (İsteğe bağlı — boşsa TALEH323/adblock-browser kullanılır)</label>
+            <input id="cfg-url" type="text" value="{manifest_esc}" placeholder="https://.../version.json">
+          </div>
+          <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:4px;">
+            <button class="btn btn-primary" onclick="saveUpdateCfg()">Kaydet ve Bağlantıyı Test Et</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Değişikliklerden Sürüm Yükseltme Nasıl Çalışır?</div>
+          <p class="muted">
+            1. Kod değişikliği yaptıktan sonra aşağıdaki tek komutu çalıştırdığınızda son commit'ler otomatik olarak <strong>CHANGELOG.json</strong>'a eklenir, <strong>Cargo.toml</strong> ve Windows Installer sürümü yükseltilir.<br>
+            2. Etiket (<code>v0.2.0</code>) GitHub'a gönderildiğinde GitHub Actions yeni <strong>Windows Setup (.exe)</strong> ve <strong>macOS (.dmg)</strong> kurucularını Release olarak yayınlar ve Başlatıcı bunu algılayıp günceller.
+          </p>
+          <div class="code-box">bash rust-browser/scripts/bump_release.sh 0.2.0 "Yeni özellikler"<br>git tag v0.2.0 &amp;&amp; git push origin main v0.2.0</div>
+        </div>
+      </div>
     </div>
-    <div class="opt-row">
-      <label><input id="chk-auto" type="checkbox" {checked_attr} onchange="sendL('launcher_set_auto', {{enabled:this.checked}})"> Güncelse tarayıcıyı otomatik aç</label>
-      <span>AdBlock Engine • DoH • AES-256</span>
+
+    <div class="footer">
+      <label class="auto-lbl">
+        <input id="chk-auto" type="checkbox" {checked_attr} onchange="sendL('launcher_set_auto', {{enabled:this.checked}})">
+        Güncelse otomatik başlat
+      </label>
+      <div class="btn-group">
+        <button id="btn-recheck" class="btn btn-ghost" onclick="sendL('launcher_recheck')">Kontrol Et</button>
+        <button id="btn-update" class="btn btn-green" style="display:none;" onclick="startUpdate()">Şimdi Güncelle</button>
+        <button id="btn-launch" class="btn btn-primary" onclick="sendL('launcher_launch')">Tarayıcıyı Başlat</button>
+      </div>
     </div>
-  </div>
+  </section>
 </div>
 <script>
+  const BUILTIN_CL = {changelog_json};
   function sendL(cmd, extra) {{
     if (window.ipc) {{
       window.ipc.postMessage(JSON.stringify({{ type: 'internal_cmd', cmd, ...(extra || {{}}) }}));
     }}
+  }}
+  function switchTab(name) {{
+    document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+    document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'pane-' + name));
+    const labels = {{
+      overview: 'Başlatıcı & Sürüm Kontrolü',
+      changelog: 'Dahili Sürüm Kaydı ve Değişiklikler',
+      source: 'Güncelleme Kaynağı & Sürüm Yükseltme'
+    }};
+    document.getElementById('tb-label').textContent = labels[name] || '';
   }}
   function startUpdate() {{
     document.getElementById('btn-update').disabled = true;
@@ -681,13 +1015,37 @@ pub fn launcher_html(auto_launch_if_current: bool, manifest_url: &str, has_token
       url: document.getElementById('cfg-url').value,
       rules: document.getElementById('cfg-tok').value
     }});
-    document.getElementById('cfg').classList.remove('open');
+    switchTab('overview');
   }}
+  function renderBuiltInChangelog() {{
+    const latestEl = document.getElementById('latest-cl');
+    const fullEl = document.getElementById('builtin-cl-list');
+    if (BUILTIN_CL.length > 0) {{
+      latestEl.innerHTML = (BUILTIN_CL[0].changes || []).slice(0, 4).map(c => '<li>' + esc(c) + '</li>').join('');
+    }}
+    fullEl.innerHTML = BUILTIN_CL.map((e, i) => `
+      <div class="card">
+        <div class="card-hdr">
+          <div style="font-size:13.5px; font-weight:600;">v${{esc(e.version)}} — ${{esc(e.title)}}</div>
+          <span class="badge ${{i===0 ? 'ok' : ''}}">${{esc(e.date)}}</span>
+        </div>
+        <ul class="cl-list">${{(e.changes || []).map(c => '<li>' + esc(c) + '</li>').join('')}}</ul>
+      </div>
+    `).join('');
+  }}
+  function esc(s) {{
+    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }}
+  renderBuiltInChangelog();
+
   window.__setLauncherState = (st) => {{
     const dot = document.getElementById('dot');
     const title = document.getElementById('st-title');
     const sub = document.getElementById('st-sub');
+    const badge = document.getElementById('st-badge');
+    const progWrap = document.getElementById('prog-wrap');
     const bar = document.getElementById('bar');
+    const helper = document.getElementById('st-helper');
     const btnUpd = document.getElementById('btn-update');
     const btnLaunch = document.getElementById('btn-launch');
     const btnRecheck = document.getElementById('btn-recheck');
@@ -695,32 +1053,64 @@ pub fn launcher_html(auto_launch_if_current: bool, manifest_url: &str, has_token
     dot.className = 'dot ' + (st.dot || '');
     title.textContent = st.title || '';
     sub.textContent = st.sub || '';
-    if (st.indeterminate) {{
-      bar.className = 'bar-fill indet';
+    badge.textContent = st.badge || 'Hazır';
+    badge.className = 'badge ' + (st.badge_cls || '');
+
+    if (st.show_progress) {{
+      progWrap.classList.add('show');
+      if (st.indeterminate) {{
+        bar.className = 'bar-fill indet';
+      }} else {{
+        bar.className = 'bar-fill';
+        bar.style.width = (st.progress ?? 0) + '%';
+      }}
     }} else {{
-      bar.className = 'bar-fill';
-      bar.style.width = (st.progress ?? 100) + '%';
+      progWrap.classList.remove('show');
     }}
+
+    helper.style.display = st.show_cfg_hint ? 'block' : 'none';
+
     if (st.can_update) {{
-      btnUpd.style.display = 'block';
+      btnUpd.style.display = 'inline-block';
       btnUpd.disabled = !!st.updating;
       btnUpd.textContent = st.update_label || 'Şimdi Güncelle';
-      btnLaunch.className = 'btn btn-secondary';
     }} else {{
       btnUpd.style.display = 'none';
-      btnLaunch.className = 'btn btn-primary';
     }}
     btnRecheck.disabled = !!st.checking || !!st.updating;
     btnLaunch.disabled = !!st.updating;
+
+    if (Array.isArray(st.releases) && st.releases.length > 0) {{
+      document.getElementById('remote-rel-wrap').style.display = 'flex';
+      document.getElementById('remote-releases').innerHTML = st.releases.map(r =>
+        `<div class="commit-row" style="flex-direction:column; gap:3px;">
+          <div style="display:flex; justify-content:space-between; width:100%;">
+            <span style="font-weight:600; color:#eef2f7;">v${{esc(r.version)}}</span>
+            <span class="cdate">${{esc(r.date)}}</span>
+          </div>
+          <div class="muted" style="font-size:11.8px;">${{esc(r.notes || 'Sürüm notu yok.')}}</div>
+        </div>`
+      ).join('');
+    }}
+
+    if (Array.isArray(st.commits) && st.commits.length > 0) {{
+      document.getElementById('remote-cl-wrap').style.display = 'flex';
+      document.getElementById('remote-commits').innerHTML = st.commits.map(c =>
+        `<div class="commit-row"><span class="sha">${{esc(c.sha)}}</span><span class="cmsg">${{esc(c.message)}}</span><span class="cdate">${{esc(c.date)}}</span></div>`
+      ).join('');
+    }}
   }};
   window.addEventListener('keydown', (e) => {{
-    if (e.key === 'Enter' && !document.getElementById('btn-launch').disabled) {{
+    if (e.key === 'Enter' && e.target.tagName !== 'INPUT' && !document.getElementById('btn-launch').disabled) {{
       sendL('launcher_launch');
     }}
   }});
 </script>
 </body>
-</html>"###
+</html>"###,
+        blocked = stats.blocked_total,
+        pws = stats.password_count,
+        bms = stats.bookmark_count,
     )
 }
 
@@ -772,10 +1162,19 @@ mod tests {
     }
 
     #[test]
-    fn renders_launcher_html_cleanly() {
-        let html = launcher_html(true, "", false);
+    fn parses_builtin_changelog_and_renders_launcher() {
+        let cl = built_in_changelog();
+        assert!(!cl.is_empty());
+        assert_eq!(cl[0].version, APP_VERSION);
+
+        let stats = LauncherProfileStats {
+            blocked_total: 42,
+            password_count: 5,
+            bookmark_count: 3,
+        };
+        let html = launcher_html(true, "", false, &stats);
         assert!(html.contains("AdBlock Tarayıcı"));
-        assert!(html.contains("launcher_launch"));
-        assert!(html.contains("data:image/png;base64,"));
+        assert!(html.contains("launcher_drag"));
+        assert!(html.contains("42"));
     }
 }
