@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.3.7",
+    "date": "2026-11-12",
+    "title": "macOS Tam Ekran & Video Tam Ekran Düzeltmesi",
+    "tag": "v0.3.7",
+    "changes": [
+      "macOS tam ekran butonu/video düzeltmesi ve Windows derleme uyarı temizliği"
+    ]
+  },
+  {
     "version": "0.3.6",
     "date": "2026-11-12",
     "title": "macOS Tam Ekran Butonu Düzeltmesi",
