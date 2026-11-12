@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.3.2",
+    "date": "2026-11-12",
+    "title": "Windows WebView2 Tarayıcı Başlatma Düzeltmesi",
+    "tag": "v0.3.2",
+    "changes": [
+      "Windows WebView2: UI ve sekme bağlamlarını (WebContext) ayırarak tarayıcı açılış çökmesini gider"
+    ]
+  },
+  {
     "version": "0.3.1",
     "date": "2026-11-12",
     "title": "Windows Güncelleme & Konsol Düzeltmesi",
