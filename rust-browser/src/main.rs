@@ -31,6 +31,8 @@ use std::thread;
 use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+#[cfg(not(target_os = "macos"))]
+use tao::window::Fullscreen;
 use tao::window::WindowBuilder;
 use wry::dpi::{LogicalPosition, LogicalSize as WrySize};
 use wry::{
@@ -42,6 +44,15 @@ const TAB_SHORTCUTS_JS: &str = r###"
 (() => {
   if (window.__abShortcuts) return;
   window.__abShortcuts = true;
+  if (window.top === window.self) {
+    const syncFs = () => {
+      if (!window.ipc) return;
+      const active = !!(document.fullscreenElement || document.webkitFullscreenElement);
+      window.ipc.postMessage(JSON.stringify({ type: 'ui_cmd', cmd: 'dom_fullscreen', enabled: active }));
+    };
+    document.addEventListener('fullscreenchange', syncFs, true);
+    document.addEventListener('webkitfullscreenchange', syncFs, true);
+  }
   window.addEventListener('keydown', (e) => {
     const mod = e.metaKey || e.ctrlKey;
     if (e.key === 'Escape' && window.ipc) {
@@ -173,6 +184,8 @@ struct BrowserApp {
     launcher_webview: Option<WebView>,
     launcher_ready: bool,
     in_launcher: bool,
+    video_fullscreen: bool,
+    pre_fullscreen_maximized: bool,
     updating_now: bool,
     pending_update: Option<ReleaseInfo>,
 }
@@ -329,6 +342,39 @@ impl BrowserApp {
         self.sync_chrome_bar();
     }
 
+    fn set_video_fullscreen(&mut self, enabled: bool) {
+        if self.in_launcher || self.video_fullscreen == enabled {
+            return;
+        }
+        self.video_fullscreen = enabled;
+        if enabled {
+            self.close_popover();
+            self.pre_fullscreen_maximized = self.window.is_maximized();
+            let _ = self.chrome_bar.set_visible(false);
+            if let Some(sp) = &self.side_panel {
+                let _ = sp.set_visible(false);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let mon = self.window.current_monitor();
+                self.window.set_fullscreen(Some(Fullscreen::Borderless(mon)));
+            }
+        } else {
+            #[cfg(not(target_os = "macos"))]
+            {
+                self.window.set_fullscreen(None);
+                if self.pre_fullscreen_maximized {
+                    self.window.set_maximized(true);
+                }
+            }
+            let _ = self.chrome_bar.set_visible(true);
+            if let Some(sp) = &self.side_panel {
+                let _ = sp.set_visible(true);
+            }
+        }
+        self.layout_views();
+    }
+
     fn layout_views(&self) {
         let (w, h) = self.logical_size();
         if self.in_launcher {
@@ -340,6 +386,23 @@ impl BrowserApp {
                 let _ = lw.set_visible(true);
             }
             let _ = self.chrome_bar.set_visible(false);
+            return;
+        }
+
+        if self.video_fullscreen {
+            let _ = self.chrome_bar.set_visible(false);
+            if let Some(sp) = &self.side_panel {
+                let _ = sp.set_visible(false);
+            }
+            let full_rect = Rect {
+                position: LogicalPosition::new(0.0, 0.0).into(),
+                size: WrySize::new(w, h).into(),
+            };
+            for (i, tab) in self.tabs.iter().enumerate() {
+                let active = i == self.active_tab_idx;
+                let _ = tab.webview.set_bounds(full_rect);
+                let _ = tab.webview.set_visible(active);
+            }
             return;
         }
 
@@ -355,6 +418,7 @@ impl BrowserApp {
         let content_h = (h - bh).max(120.0);
 
         if let Some(sp) = &self.side_panel {
+            let _ = sp.set_visible(true);
             let _ = sp.set_bounds(Rect {
                 position: LogicalPosition::new(content_w, bh).into(),
                 size: WrySize::new(sp_w, content_h).into(),
@@ -515,6 +579,9 @@ impl BrowserApp {
     }
 
     fn close_tab_by_id(&mut self, id: usize) {
+        if self.video_fullscreen {
+            self.set_video_fullscreen(false);
+        }
         if self.tabs.len() <= 1 {
             self.navigate_tab_idx(0, "adblock://home");
             self.save_session_tabs();
@@ -534,6 +601,9 @@ impl BrowserApp {
 
     fn switch_to_tab_id(&mut self, id: usize) {
         if let Some(pos) = self.tabs.iter().position(|t| t.id == id) {
+            if self.video_fullscreen && pos != self.active_tab_idx {
+                self.set_video_fullscreen(false);
+            }
             self.active_tab_idx = pos;
             if let Ok(mut ab) = self.adblock.write() {
                 ab.active_page_url = self.tabs[pos].url.clone();
@@ -824,7 +894,7 @@ impl BrowserApp {
         self.sync_chrome_bar();
     }
 
-    fn handle_ipc(&mut self, _source_tab_id: Option<usize>, raw: &str) {
+    fn handle_ipc(&mut self, source_tab_id: Option<usize>, raw: &str) {
         let Ok(env) = serde_json::from_str::<IpcEnvelope>(raw) else {
             return;
         };
@@ -861,6 +931,14 @@ impl BrowserApp {
         let active_idx = self.active_tab_idx;
         match env.cmd.as_str() {
             "close_popover" => self.close_popover(),
+            "dom_fullscreen" => {
+                let from_active = source_tab_id
+                    .and_then(|id| self.tabs.get(active_idx).map(|t| t.id == id))
+                    .unwrap_or(true);
+                if from_active {
+                    self.set_video_fullscreen(env.enabled);
+                }
+            }
             "resize_popover" => {
                 if let (Some(pop), Some((px, py, pw)), Some(req_h)) =
                     (&self.popover, self.popover_rect, env.height)
@@ -1556,6 +1634,8 @@ fn main() {
         launcher_webview: Some(launcher_webview),
         launcher_ready: false,
         in_launcher: true,
+        video_fullscreen: false,
+        pre_fullscreen_maximized: false,
         updating_now: false,
         pending_update: None,
     };
