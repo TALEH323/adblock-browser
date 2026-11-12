@@ -234,6 +234,7 @@ struct BrowserApp {
     launcher_ready: bool,
     in_launcher: bool,
     video_fullscreen: bool,
+    #[cfg(not(target_os = "macos"))]
     pre_fullscreen_maximized: bool,
     updating_now: bool,
     pending_update: Option<ReleaseInfo>,
@@ -364,13 +365,36 @@ impl BrowserApp {
             let _ = lw.set_visible(false);
             drop(lw);
         }
-        // `set_resizable(true)` MUST precede `set_decorations(true)` on macOS because `tao::set_decorations`
-        // snapshots `resizable` and applies `set_style_mask_async` later, which would otherwise strip `Resizable`.
         self.window.set_resizable(true);
         self.window.set_decorations(true);
         self.window.set_maximizable(true);
         self.window.set_minimizable(true);
         self.window.set_closable(true);
+        #[cfg(target_os = "macos")]
+        unsafe {
+            use std::ffi::c_void;
+            use tao::platform::macos::WindowExtMacOS;
+            extern "C" {
+                fn sel_registerName(name: *const std::os::raw::c_char) -> *const c_void;
+                fn objc_msgSend();
+            }
+            let ns_win = self.window.ns_window();
+            if !ns_win.is_null() {
+                let sel_get = sel_registerName(b"collectionBehavior\0".as_ptr() as *const _);
+                let sel_set = sel_registerName(b"setCollectionBehavior:\0".as_ptr() as *const _);
+                let get_fn: unsafe extern "C" fn(*mut c_void, *const c_void) -> usize =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+                let set_fn: unsafe extern "C" fn(*mut c_void, *const c_void, usize) =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+                let cur = get_fn(ns_win, sel_get);
+                const NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_PRIMARY: usize = 1 << 7;
+                set_fn(
+                    ns_win,
+                    sel_set,
+                    cur | NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_PRIMARY,
+                );
+            }
+        }
         self.window.set_title("AdBlock Tarayıcı");
         self.window.set_inner_size(LogicalSize::new(1280.0, 820.0));
         center_window_logical(&self.window, 1280.0, 820.0);
@@ -400,33 +424,37 @@ impl BrowserApp {
         if self.in_launcher || self.video_fullscreen == enabled {
             return;
         }
-        self.video_fullscreen = enabled;
-        if enabled {
-            self.close_popover();
-            self.pre_fullscreen_maximized = self.window.is_maximized();
-            let _ = self.chrome_bar.set_visible(false);
-            if let Some(sp) = &self.side_panel {
-                let _ = sp.set_visible(false);
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
+        #[cfg(target_os = "macos")]
+        {
+            // WKWebView natively manages HTML5 video fullscreen Spaces on macOS;
+            // calling `set_bounds` in `layout_views` during that transition shrinks the video to window size.
+            self.video_fullscreen = enabled;
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.video_fullscreen = enabled;
+            if enabled {
+                self.close_popover();
+                self.pre_fullscreen_maximized = self.window.is_maximized();
+                let _ = self.chrome_bar.set_visible(false);
+                if let Some(sp) = &self.side_panel {
+                    let _ = sp.set_visible(false);
+                }
                 let mon = self.window.current_monitor();
                 self.window.set_fullscreen(Some(Fullscreen::Borderless(mon)));
-            }
-        } else {
-            #[cfg(not(target_os = "macos"))]
-            {
+            } else {
                 self.window.set_fullscreen(None);
                 if self.pre_fullscreen_maximized {
                     self.window.set_maximized(true);
                 }
+                let _ = self.chrome_bar.set_visible(true);
+                if let Some(sp) = &self.side_panel {
+                    let _ = sp.set_visible(true);
+                }
             }
-            let _ = self.chrome_bar.set_visible(true);
-            if let Some(sp) = &self.side_panel {
-                let _ = sp.set_visible(true);
-            }
+            self.layout_views();
         }
-        self.layout_views();
     }
 
     fn layout_views(&self) {
@@ -1829,6 +1857,7 @@ fn main() {
         launcher_ready: false,
         in_launcher: true,
         video_fullscreen: false,
+        #[cfg(not(target_os = "macos"))]
         pre_fullscreen_maximized: false,
         updating_now: false,
         pending_update: None,

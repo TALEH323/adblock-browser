@@ -1,9 +1,13 @@
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+#[cfg(target_os = "macos")]
+use std::fs;
+use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
