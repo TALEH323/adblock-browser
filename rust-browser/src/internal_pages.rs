@@ -94,7 +94,7 @@ fn wrap_shell(active: &str, title: &str, body_html: &str) -> String {
   .nav-item:hover {{ background: rgba(255,255,255,0.06); color: var(--text); }}
   .nav-item.active {{ background: rgba(138,180,248,0.16); color: var(--blue); font-weight: 600; }}
   main {{ flex: 1; padding: 32px 44px; max-width: 980px; }}
-  main.home-main {{ max-width: 860px; margin: 0 auto; }}
+  main.home-main {{ max-width: 980px; margin: 0 auto; padding-top: 24px; }}
   .header-row {{ display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 22px; }}
   h1 {{ font-size: 22px; margin: 0; font-weight: 600; }}
   .card {{
@@ -134,20 +134,83 @@ fn wrap_shell(active: &str, title: &str, body_html: &str) -> String {
     border-radius: 18px; padding: 6px 13px; cursor: pointer; font-size: 12.5px;
   }}
   .empty {{ padding: 28px; text-align: center; color: var(--sub); font-size: 13px; }}
-  .hero {{ text-align: center; padding: 48px 16px 28px; }}
+  .hero {{ text-align: center; padding: 36px 16px 18px; }}
   .hero h2 {{ font-size: 30px; margin: 12px 0 8px; }}
-  .hero-search {{ display: flex; gap: 8px; max-width: 580px; margin: 22px auto; }}
+  .hero-search {{ display: flex; gap: 8px; max-width: 600px; margin: 22px auto 10px; }}
   .hero-search input {{ flex: 1; border-radius: 24px; padding: 12px 18px; font-size: 14.5px; }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-top: 20px; }}
-  .tile {{
-    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
-    padding: 14px; cursor: pointer; text-align: left; color: var(--text);
+  .bm-section {{ margin-top: 22px; }}
+  .bm-head {{
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 14px; padding: 0 2px;
   }}
-  .tile:hover {{ border-color: var(--blue); background: #303236; }}
-  .stat-strip {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 24px; }}
-  .stat-box {{ background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 16px; text-align: center; }}
-  .stat-val {{ font-size: 24px; font-weight: 700; color: var(--green); }}
-  .stat-lbl {{ font-size: 12px; color: var(--sub); margin-top: 4px; }}
+  .bm-head-title {{ font-size: 14px; font-weight: 600; color: var(--sub); letter-spacing: 0.2px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 18px; }}
+  .tile {{
+    background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
+    padding: 0; cursor: pointer; text-align: left; color: var(--text);
+    overflow: hidden; display: flex; flex-direction: column;
+    transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+  }}
+  .tile:hover {{
+    border-color: var(--blue); background: #303236;
+    transform: translateY(-2px); box-shadow: 0 10px 26px rgba(0,0,0,0.32);
+  }}
+  .tile-preview {{
+    position: relative; width: 100%; height: 154px;
+    background: linear-gradient(135deg, #1b1d21 0%, #25282e 100%);
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    overflow: hidden; display: flex; align-items: center; justify-content: center;
+  }}
+  .tile-preview-bar {{
+    position: absolute; top: 0; left: 0; right: 0; height: 22px; z-index: 2;
+    background: rgba(20, 21, 24, 0.82); backdrop-filter: blur(6px);
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+    display: flex; align-items: center; gap: 5px; padding: 0 10px;
+  }}
+  .tile-dot {{ width: 6px; height: 6px; border-radius: 50%; background: #4e5259; }}
+  .tile-dot.r {{ background: #e06c75; }}
+  .tile-dot.y {{ background: #e5c07b; }}
+  .tile-dot.g {{ background: #81c995; }}
+  .tile-preview-domain {{
+    margin-left: 4px; font-size: 10.5px; color: var(--sub);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }}
+  .tile-fallback {{
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; padding-top: 22px; color: var(--sub); font-size: 12px;
+  }}
+  .tile-fallback-icon {{
+    width: 44px; height: 44px; border-radius: 12px;
+    background: rgba(138,180,248,0.12); border: 1px solid rgba(138,180,248,0.24);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: 700; color: var(--blue); overflow: hidden;
+  }}
+  .tile-fallback-icon img {{ width: 28px; height: 28px; border-radius: 6px; }}
+  .tile-shot {{
+    position: absolute; top: 22px; left: 0; width: 100%; height: calc(100% - 22px);
+    object-fit: cover; object-position: top center; z-index: 1;
+    opacity: 0; transition: opacity 0.25s ease, transform 0.25s ease;
+  }}
+  .tile-shot.loaded {{ opacity: 1; }}
+  .tile:hover .tile-shot.loaded {{ transform: scale(1.03); }}
+  .tile-meta {{
+    display: flex; align-items: center; gap: 11px; padding: 13px 15px; min-width: 0; width: 100%;
+  }}
+  .tile-fav {{
+    width: 24px; height: 24px; border-radius: 7px; flex-shrink: 0;
+    background: rgba(255,255,255,0.06); display: flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 700; color: var(--blue); overflow: hidden;
+  }}
+  .tile-fav img {{ width: 18px; height: 18px; border-radius: 4px; }}
+  .tile-text {{ min-width: 0; flex: 1; }}
+  .tile-title {{
+    font-size: 14.5px; font-weight: 600; color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }}
+  .tile-url {{
+    font-size: 12px; color: var(--sub); margin-top: 2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }}
 </style>
 <script>
   function sendCmd(cmd, payload) {{
@@ -173,6 +236,34 @@ fn wrap_shell(active: &str, title: &str, body_html: &str) -> String {
     )
 }
 
+fn bookmark_host(raw_url: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(raw_url) {
+        if let Some(host) = parsed.host_str() {
+            return host.trim_start_matches("www.").to_string();
+        }
+    }
+    raw_url.to_string()
+}
+
+fn is_public_http_url(raw_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw_url) else {
+        return false;
+    };
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let lower = host.to_ascii_lowercase();
+    lower.contains('.')
+        && lower != "localhost"
+        && !lower.starts_with("127.")
+        && !lower.starts_with("10.")
+        && !lower.starts_with("192.168.")
+        && !lower.ends_with(".local")
+}
+
 pub fn render_route(
     route: &str,
     storage: &BrowserStorage,
@@ -180,7 +271,7 @@ pub fn render_route(
     pw: &PasswordManager,
 ) -> String {
     match route {
-        "home" => render_home(storage, ab),
+        "home" => render_home(storage),
         "settings" => render_settings(storage),
         "downloads" => render_downloads(storage),
         "passwords" => render_passwords(storage, pw),
@@ -188,23 +279,103 @@ pub fn render_route(
         "bookmarks" => render_bookmarks(storage),
         "adblock" => render_adblock(ab),
         "updates" => render_updates(),
-        _ => render_home(storage, ab),
+        _ => render_home(storage),
     }
 }
 
-fn render_home(storage: &BrowserStorage, ab: &AdBlockService) -> String {
+fn render_home(storage: &BrowserStorage) -> String {
     let mut tiles = String::new();
-    for b in storage.bookmarks.iter().take(8) {
+    for b in storage.bookmarks.iter().take(9) {
+        let host = bookmark_host(&b.url);
+        let initial: String = b
+            .title
+            .trim()
+            .chars()
+            .next()
+            .or_else(|| host.chars().next())
+            .unwrap_or('•')
+            .to_uppercase()
+            .collect();
+        let initial_txt = txt(&initial);
+        let host_txt = txt(&host);
+
+        let (shot_html, fav_lg_html, fav_sm_html) = if is_public_http_url(&b.url) {
+            let shot_src = format!(
+                "https://image.thum.io/get/width/640/crop/400/noanimate/{}",
+                b.url.trim()
+            );
+            let fav_src = format!(
+                "https://www.google.com/s2/favicons?domain={}&sz=64",
+                host
+            );
+            (
+                format!(
+                    r###"<img class="tile-shot" loading="lazy" src="{}" alt="" onload="this.classList.add('loaded')" onerror="this.style.display='none'">"###,
+                    attr(&shot_src)
+                ),
+                format!(
+                    r###"<img src="{}" alt="" onerror="this.replaceWith(document.createTextNode(this.dataset.fb))" data-fb="{}">"###,
+                    attr(&fav_src),
+                    attr(&initial)
+                ),
+                format!(
+                    r###"<img src="{}" alt="" onerror="this.replaceWith(document.createTextNode(this.dataset.fb))" data-fb="{}">"###,
+                    attr(&fav_src),
+                    attr(&initial)
+                ),
+            )
+        } else {
+            (
+                String::new(),
+                initial_txt.to_string(),
+                initial_txt.to_string(),
+            )
+        };
+
         tiles.push_str(&format!(
-            r###"<button class="tile" onclick="sendCmd('navigate', {{url:'{}'}})">
-                <div class="row-title">{}</div>
-                <div class="row-sub">{}</div>
+            r###"<button class="tile" data-url="{}" onclick="sendCmd('navigate', {{url: this.dataset.url}})">
+                <div class="tile-preview">
+                  <div class="tile-preview-bar">
+                    <span class="tile-dot r"></span>
+                    <span class="tile-dot y"></span>
+                    <span class="tile-dot g"></span>
+                    <span class="tile-preview-domain">{host_txt}</span>
+                  </div>
+                  <div class="tile-fallback">
+                    <div class="tile-fallback-icon">{fav_lg_html}</div>
+                    <span>{host_txt}</span>
+                  </div>
+                  {shot_html}
+                </div>
+                <div class="tile-meta">
+                  <div class="tile-fav">{fav_sm_html}</div>
+                  <div class="tile-text">
+                    <div class="tile-title">{}</div>
+                    <div class="tile-url">{host_txt}</div>
+                  </div>
+                </div>
             </button>"###,
             attr(&b.url),
             txt(&b.title),
-            txt(&b.url)
         ));
     }
+
+    let bookmarks_section = if tiles.is_empty() {
+        r###"<div class="bm-section">
+          <div class="empty">Henüz yer imi eklenmemiş. Adres çubuğundaki ★ simgesiyle hızlıca yer imi ekleyebilirsiniz.</div>
+        </div>"###
+            .to_string()
+    } else {
+        format!(
+            r###"<div class="bm-section">
+          <div class="bm-head">
+            <div class="bm-head-title">Yer İmleri</div>
+            <button class="btn" onclick="sendCmd('open_internal', {{route:'bookmarks'}})">Tümünü Yönet</button>
+          </div>
+          <div class="grid">{tiles}</div>
+        </div>"###
+        )
+    };
 
     let body = format!(
         r###"
@@ -217,16 +388,8 @@ fn render_home(storage: &BrowserStorage, ab: &AdBlockService) -> String {
             <button type="submit" class="btn-primary">Git</button>
           </form>
         </div>
-        <div class="stat-strip">
-          <div class="stat-box"><div class="stat-val">{}</div><div class="stat-lbl">Toplam Engellenen</div></div>
-          <div class="stat-box"><div class="stat-val" style="color:#8ab4f8;">{}</div><div class="stat-lbl">Aktif Kural</div></div>
-          <div class="stat-box"><div class="stat-val" style="color:#d2a8ff;">{}</div><div class="stat-lbl">Güvenlik Kalkanı</div></div>
-        </div>
-        <div class="grid">{tiles}</div>
-        "###,
-        ab.total_blocked,
-        ab.total_rules_count,
-        if storage.settings.dns_protection { "HTTPS + DoH" } else { "Standart" }
+        {bookmarks_section}
+        "###
     );
     wrap_shell("home", "Yeni Sekme — AdBlock Tarayıcı", &body)
 }
@@ -234,6 +397,23 @@ fn render_home(storage: &BrowserStorage, ab: &AdBlockService) -> String {
 fn render_settings(storage: &BrowserStorage) -> String {
     let s = &storage.settings;
     let chk = |b: bool| if b { "checked" } else { "" };
+    let zoom_pct = (s.effective_zoom() * 100.0).round() as i32;
+    let effective_dl = storage.effective_download_dir().to_string_lossy().to_string();
+
+    let notice_html = if let Some(msg) = &storage.settings_notice {
+        format!(
+            r###"<div class="card" style="border-color:rgba(129,201,149,0.45); background:rgba(129,201,149,0.10);">
+              <div class="row">
+                <div class="row-info"><div class="row-title" style="color:var(--green);">{}</div></div>
+                <button class="btn" onclick="sendCmd('clear_settings_notice')">Kapat</button>
+              </div>
+            </div>"###,
+            txt(msg)
+        )
+    } else {
+        String::new()
+    };
+
     let mut http_rows = String::new();
     for d in &s.http_allowed_domains {
         http_rows.push_str(&format!(
@@ -247,17 +427,33 @@ fn render_settings(storage: &BrowserStorage) -> String {
         http_rows = r###"<div class="empty">HTTP istisnası tanımlanmış site yok.</div>"###.to_string();
     }
 
+    let zoom_opts = [75, 85, 90, 100, 110, 125, 150]
+        .iter()
+        .map(|pct| {
+            let sel = if (*pct - zoom_pct).abs() <= 2 { "selected" } else { "" };
+            let val = (*pct as f64) / 100.0;
+            let lbl = if *pct == 100 {
+                "%100 (Varsayılan)".to_string()
+            } else {
+                format!("%{pct}")
+            };
+            format!(r#"<option value="{val:.2}" {sel}>{lbl}</option>"#)
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
     let body = format!(
         r###"
         <div class="header-row"><h1>Tarayıcı Ayarları</h1></div>
+        {notice_html}
         <div class="card">
           <div class="card-title">Gizlilik, Güvenlik ve Engelleme</div>
           <div class="row">
-            <div class="row-info"><div class="row-title">Reklam & İzleyici Engelleme</div><div class="row-sub">Genel AdBlock Plus motorunu aç/kapat</div></div>
+            <div class="row-info"><div class="row-title">Reklam &amp; İzleyici Engelleme</div><div class="row-sub">Genel AdBlock Plus motorunu aç/kapat</div></div>
             <input type="checkbox" {} onchange="sendCmd('set_setting', {{key:'adblock_enabled', val:this.checked}})">
           </div>
           <div class="row">
-            <div class="row-info"><div class="row-title">Kozmetik & YouTube Filtreleme</div><div class="row-sub">Reklam kutularını gizle ve video reklamlarını atla</div></div>
+            <div class="row-info"><div class="row-title">Kozmetik &amp; YouTube Filtreleme</div><div class="row-sub">Reklam kutularını gizle ve video reklamlarını atla</div></div>
             <input type="checkbox" {} onchange="sendCmd('set_setting', {{key:'cosmetic_enabled', val:this.checked}})">
           </div>
           <div class="row">
@@ -272,22 +468,102 @@ fn render_settings(storage: &BrowserStorage) -> String {
             <div class="row-info"><div class="row-title">Şifre Kaydetme Önerisi</div><div class="row-sub">Giriş formlarını şifreli kasaya kaydetmeyi teklif et</div></div>
             <input type="checkbox" {} onchange="sendCmd('set_setting', {{key:'password_saving_enabled', val:this.checked}})">
           </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Tarama Verilerini Temizle</div>
           <div class="row">
-            <div class="row-info"><div class="row-title">Yer İmleri Çubuğunu Göster</div></div>
-            <input type="checkbox" {} onchange="sendCmd('set_setting', {{key:'show_bookmarks_bar', val:this.checked}})">
+            <div class="row-info"><div class="row-title">Tarama Geçmişi</div><div class="row-sub">Ziyaret edilen adreslerin listesini siler</div></div>
+            <input id="cbd-history" type="checkbox" checked>
+          </div>
+          <div class="row">
+            <div class="row-info"><div class="row-title">Çerezler ve Site Oturumları</div><div class="row-sub">Sitelerdeki oturum ve çerez kayıtlarını temizler (kayıtlı şifre kasasına dokunmaz)</div></div>
+            <input id="cbd-cookies" type="checkbox" checked>
+          </div>
+          <div class="row">
+            <div class="row-info"><div class="row-title">İndirme Geçmişi Listesi</div><div class="row-sub">Yalnızca tarayıcıdaki listeyi temizler, diskteki dosyaları silmez</div></div>
+            <input id="cbd-downloads" type="checkbox">
+          </div>
+          <div class="row">
+            <div class="row-info"><div class="row-title">Seçili Verileri Temizle</div></div>
+            <button class="btn-danger" onclick="sendCmd('clear_browsing_data', {{clear_history: document.getElementById('cbd-history').checked, clear_cookies: document.getElementById('cbd-cookies').checked, clear_downloads: document.getElementById('cbd-downloads').checked}})">Verileri Temizle</button>
           </div>
         </div>
+
         <div class="card">
-          <div class="card-title">Arama Motoru & Ana Sayfa</div>
+          <div class="card-title">Görünüm ve Performans</div>
+          <div class="row">
+            <div class="row-info"><div class="row-title">Yer İmleri Çubuğunu Göster</div><div class="row-sub">Adres çubuğunun altında hızlı erişim çubuğu</div></div>
+            <input type="checkbox" {} onchange="sendCmd('set_setting', {{key:'show_bookmarks_bar', val:this.checked}})">
+          </div>
+          <div class="row">
+            <div class="row-info"><div class="row-title">Varsayılan Sayfa Yakınlaştırma</div><div class="row-sub">Tüm açık ve yeni sekmelerde sayfa ölçeğini ayarlar</div></div>
+            <select onchange="sendCmd('set_setting', {{key:'default_zoom', val: parseFloat(this.value)}})">
+              {zoom_opts}
+            </select>
+          </div>
+          <div class="row">
+            <div class="row-info"><div class="row-title">Bellek &amp; Enerji Tasarrufu</div><div class="row-sub">Arka plandaki sekmelerin CPU kullanımını kısar (yeni açılan sekmelerde geçerli)</div></div>
+            <input type="checkbox" {} onchange="sendCmd('set_setting', {{key:'background_throttling', val:this.checked}})">
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Arama Motoru, Başlangıç ve Ana Sayfa</div>
           <div class="row">
             <div class="row-info"><div class="row-title">Varsayılan Arama Motoru</div></div>
             <select onchange="sendCmd('set_setting', {{key:'search_engine', val:this.value}})">
               <option value="https://www.google.com/search?q=" {}>Google</option>
               <option value="https://duckduckgo.com/?q=" {}>DuckDuckGo</option>
               <option value="https://search.brave.com/search?q=" {}>Brave Search</option>
+              <option value="https://www.bing.com/search?q=" {}>Bing</option>
+              <option value="https://yandex.com/search/?text=" {}>Yandex</option>
             </select>
           </div>
+          <div class="row">
+            <div class="row-info"><div class="row-title">Başlangıçta</div><div class="row-sub">Tarayıcı başlatıldığında hangi sekmelerin açılacağını belirler</div></div>
+            <select onchange="sendCmd('set_setting', {{key:'startup_mode', val:this.value}})">
+              <option value="new_tab" {}>Yeni Sekme sayfasını aç</option>
+              <option value="restore" {}>Kaldığın yerden devam et (son sekmeler)</option>
+              <option value="custom" {}>Özel ana sayfayı aç</option>
+            </select>
+          </div>
+          <div class="row">
+            <div class="row-info">
+              <div class="row-title">Ana Sayfa Adresi</div>
+              <div class="row-sub">Araç çubuğundaki Ana Sayfa düğmesi ve özel başlangıç için</div>
+            </div>
+            <div class="actions">
+              <input id="home-url-inp" type="text" style="width:240px;" value="{}" placeholder="adblock://home">
+              <button class="btn-primary" onclick="sendCmd('set_setting', {{key:'home_url', val: document.getElementById('home-url-inp').value}})">Kaydet</button>
+              <button class="btn" onclick="sendCmd('set_setting', {{key:'home_url', val:'adblock://home'}})">Sıfırla</button>
+            </div>
+          </div>
         </div>
+
+        <div class="card">
+          <div class="card-title">İndirilenler, Sistem ve Sıfırlama</div>
+          <div class="row">
+            <div class="row-info">
+              <div class="row-title">İndirme Klasörü</div>
+              <div class="row-sub">Etkin konum: {}</div>
+            </div>
+            <div class="actions">
+              <input id="dl-dir-inp" type="text" style="width:230px;" value="{}" placeholder="Sistem Varsayılanı">
+              <button class="btn-primary" onclick="sendCmd('set_setting', {{key:'download_dir', val: document.getElementById('dl-dir-inp').value}})">Kaydet</button>
+              <button class="btn" onclick="sendCmd('open_download_dir')">Klasörü Aç</button>
+            </div>
+          </div>
+          <div class="row">
+            <div class="row-info"><div class="row-title">Varsayılan Tarayıcı</div><div class="row-sub">İşletim sistemi varsayılan tarayıcı ayarlarını açar</div></div>
+            <button class="btn" onclick="sendCmd('open_default_browser_settings')">Sistem Ayarlarını Aç</button>
+          </div>
+          <div class="row">
+            <div class="row-info"><div class="row-title">Ayarları Sıfırla</div><div class="row-sub">Gizlilik, arama, yakınlaştırma ve başlangıç ayarlarını varsayılana döndürür (şifreleriniz ve yer imleriniz korunur)</div></div>
+            <button class="btn-danger" onclick="if(confirm('Tüm tarayıcı ayarları varsayılanlara döndürülsün mü?')) sendCmd('reset_settings')">Ayarları Sıfırla</button>
+          </div>
+        </div>
+
         <div class="card">
           <div class="card-title">HTTP İstisnaları (Güvensiz Bağlantıya İzin Verilen Siteler)</div>
           {http_rows}
@@ -299,9 +575,18 @@ fn render_settings(storage: &BrowserStorage) -> String {
         chk(s.dns_protection),
         chk(s.password_saving_enabled),
         chk(s.show_bookmarks_bar),
+        chk(s.background_throttling),
         if s.search_engine.contains("google") { "selected" } else { "" },
         if s.search_engine.contains("duckduckgo") { "selected" } else { "" },
         if s.search_engine.contains("brave") { "selected" } else { "" },
+        if s.search_engine.contains("bing") { "selected" } else { "" },
+        if s.search_engine.contains("yandex") { "selected" } else { "" },
+        if s.startup_mode == "new_tab" || (s.startup_mode != "restore" && s.startup_mode != "custom") { "selected" } else { "" },
+        if s.startup_mode == "restore" { "selected" } else { "" },
+        if s.startup_mode == "custom" { "selected" } else { "" },
+        attr(&s.home_url),
+        txt(&effective_dl),
+        attr(&s.download_dir),
     );
     wrap_shell("settings", "Ayarlar — AdBlock Tarayıcı", &body)
 }
@@ -677,6 +962,24 @@ mod tests {
             let html = render_route(route, &storage, &ab, &pw);
             assert!(html.contains("AdBlock Tarayıcı"), "route {route} failed");
         }
+
+        let home_html = render_route("home", &storage, &ab, &pw);
+        assert!(!home_html.contains("Toplam Engellenen"));
+        assert!(!home_html.contains("Aktif Kural"));
+        assert!(!home_html.contains("Güvenlik Kalkanı"));
+        assert!(home_html.contains("tile-preview"));
+        assert!(home_html.contains("https://image.thum.io/get/width/640/crop/400/noanimate/https://www.google.com"));
+
+        assert!(is_public_http_url("https://www.google.com"));
+        assert!(!is_public_http_url("http://localhost:8080"));
+        assert!(!is_public_http_url("adblock://settings"));
+
+        let settings_html = render_route("settings", &storage, &ab, &pw);
+        assert!(settings_html.contains("Tarama Verilerini Temizle"));
+        assert!(settings_html.contains("Varsayılan Sayfa Yakınlaştırma"));
+        assert!(settings_html.contains("Başlangıçta"));
+        assert!(settings_html.contains("İndirme Klasörü"));
+        assert!(settings_html.contains("Ayarları Sıfırla"));
 
         let sec = render_security_interstitial("<bad>.example", "http://bad.example", "DNS block");
         assert!(sec.contains("&lt;bad&gt;.example"));

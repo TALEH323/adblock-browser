@@ -34,6 +34,16 @@ pub struct BrowserSettings {
     pub update_manifest_url: String,
     #[serde(default)]
     pub update_token: String,
+    #[serde(default = "default_startup_mode")]
+    pub startup_mode: String,
+    #[serde(default)]
+    pub last_session_tabs: Vec<String>,
+    #[serde(default = "default_zoom_factor")]
+    pub default_zoom: f64,
+    #[serde(default = "default_true")]
+    pub background_throttling: bool,
+    #[serde(default)]
+    pub download_dir: String,
 }
 
 fn default_true() -> bool {
@@ -44,6 +54,22 @@ fn default_home() -> String {
 }
 fn default_search() -> String {
     "https://www.google.com/search?q=".to_string()
+}
+fn default_startup_mode() -> String {
+    "new_tab".to_string()
+}
+fn default_zoom_factor() -> f64 {
+    1.0
+}
+
+impl BrowserSettings {
+    pub fn effective_zoom(&self) -> f64 {
+        if !self.default_zoom.is_finite() || self.default_zoom <= 0.0 {
+            1.0
+        } else {
+            self.default_zoom.clamp(0.5, 2.0)
+        }
+    }
 }
 
 impl Default for BrowserSettings {
@@ -63,6 +89,11 @@ impl Default for BrowserSettings {
             auto_launch_if_current: false,
             update_manifest_url: String::new(),
             update_token: String::new(),
+            startup_mode: default_startup_mode(),
+            last_session_tabs: Vec::new(),
+            default_zoom: default_zoom_factor(),
+            background_throttling: true,
+            download_dir: String::new(),
         }
     }
 }
@@ -97,6 +128,7 @@ pub struct BrowserStorage {
     pub history: Vec<HistoryEntry>,
     pub bookmarks: Vec<BookmarkEntry>,
     pub downloads: Vec<DownloadEntry>,
+    pub settings_notice: Option<String>,
 }
 
 pub fn resolve_data_dir() -> PathBuf {
@@ -174,7 +206,35 @@ impl BrowserStorage {
             history,
             bookmarks,
             downloads,
+            settings_notice: None,
         }
+    }
+
+    pub fn effective_download_dir(&self) -> PathBuf {
+        let custom = self.settings.download_dir.trim();
+        let dir = if !custom.is_empty() {
+            PathBuf::from(custom)
+        } else {
+            dirs::download_dir().unwrap_or_else(|| self.data_dir.join("downloads"))
+        };
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    pub fn reset_settings_to_defaults(&mut self) {
+        let total_blocked = self.settings.total_blocked;
+        let auto_launch_if_current = self.settings.auto_launch_if_current;
+        let update_manifest_url = self.settings.update_manifest_url.clone();
+        let update_token = self.settings.update_token.clone();
+
+        self.settings = BrowserSettings {
+            total_blocked,
+            auto_launch_if_current,
+            update_manifest_url,
+            update_token,
+            ..BrowserSettings::default()
+        };
+        self.save_settings();
     }
 
     pub fn save_settings(&self) {
@@ -312,6 +372,35 @@ mod tests {
         assert_eq!(reloaded.history[0].title, "Example");
         assert!(reloaded.is_bookmarked("https://example.com"));
         assert!(reloaded.is_http_allowed("legacy.local"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn settings_reset_zoom_and_download_dir_work() {
+        let tmp = std::env::temp_dir().join(format!("ab_test_reset_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let mut st = BrowserStorage::load(tmp.clone());
+        st.settings.search_engine = "https://duckduckgo.com/?q=".to_string();
+        st.settings.startup_mode = "restore".to_string();
+        st.settings.home_url = "https://example.org".to_string();
+        st.settings.default_zoom = 5.0;
+        assert_eq!(st.settings.effective_zoom(), 2.0);
+        st.settings.default_zoom = f64::NAN;
+        assert_eq!(st.settings.effective_zoom(), 1.0);
+
+        let custom_dl = tmp.join("custom_dl");
+        st.settings.download_dir = custom_dl.to_string_lossy().to_string();
+        assert_eq!(st.effective_download_dir(), custom_dl);
+        assert!(custom_dl.exists());
+
+        st.settings.update_token = "ghp_secret".to_string();
+        st.reset_settings_to_defaults();
+        assert_eq!(st.settings.startup_mode, "new_tab");
+        assert_eq!(st.settings.home_url, "adblock://home");
+        assert_eq!(st.settings.default_zoom, 1.0);
+        assert!(st.settings.download_dir.is_empty());
+        assert_eq!(st.settings.update_token, "ghp_secret");
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }

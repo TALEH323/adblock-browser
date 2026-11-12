@@ -31,7 +31,10 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
 use wry::dpi::{LogicalPosition, LogicalSize as WrySize};
-use wry::{NewWindowResponse, PageLoadEvent, ProxyConfig, ProxyEndpoint, Rect, WebView, WebViewBuilder};
+use wry::{
+    BackgroundThrottlingPolicy, NewWindowResponse, PageLoadEvent, ProxyConfig, ProxyEndpoint, Rect,
+    WebView, WebViewBuilder,
+};
 
 const TAB_SHORTCUTS_JS: &str = r###"
 (() => {
@@ -125,6 +128,12 @@ struct IpcEnvelope {
     height: Option<f64>,
     #[serde(default)]
     enabled: bool,
+    #[serde(default)]
+    clear_history: bool,
+    #[serde(default)]
+    clear_cookies: bool,
+    #[serde(default)]
+    clear_downloads: bool,
 }
 
 struct BrowserTab {
@@ -141,6 +150,7 @@ struct BrowserApp {
     event_proxy: EventLoopProxy<UserEvent>,
     proxy_port: u16,
     storage: BrowserStorage,
+    download_dir_shared: Arc<RwLock<PathBuf>>,
     passwords: PasswordManager,
     adblock: SharedAdBlock,
     dns_guard: Arc<DnsGuard>,
@@ -262,6 +272,23 @@ impl BrowserApp {
         });
     }
 
+    fn save_session_tabs(&mut self) {
+        if self.in_launcher || self.tabs.is_empty() {
+            return;
+        }
+        let urls: Vec<String> = self
+            .tabs
+            .iter()
+            .take(20)
+            .map(|t| t.url.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .collect();
+        if !urls.is_empty() && urls != self.storage.settings.last_session_tabs {
+            self.storage.settings.last_session_tabs = urls;
+            self.storage.save_settings();
+        }
+    }
+
     fn launch_browser_from_launcher(&mut self) {
         if !self.in_launcher || self.updating_now {
             return;
@@ -278,8 +305,21 @@ impl BrowserApp {
         center_window_logical(&self.window, 1280.0, 820.0);
         let _ = self.chrome_bar.set_visible(true);
         if self.tabs.is_empty() {
-            let home = self.storage.settings.home_url.clone();
-            self.create_tab(&home, true);
+            match self.storage.settings.startup_mode.as_str() {
+                "restore" if !self.storage.settings.last_session_tabs.is_empty() => {
+                    let urls = self.storage.settings.last_session_tabs.clone();
+                    for (i, u) in urls.into_iter().enumerate() {
+                        self.create_tab(&u, i == 0);
+                    }
+                }
+                "custom" => {
+                    let home = self.storage.settings.home_url.clone();
+                    self.create_tab(&home, true);
+                }
+                _ => {
+                    self.create_tab("adblock://home", true);
+                }
+            }
         }
         self.layout_views();
         self.sync_chrome_bar();
@@ -347,14 +387,23 @@ impl BrowserApp {
             size: WrySize::new((w - sp_w).max(200.0), (h - bh).max(120.0)).into(),
         };
 
-        let downloads_dir = dirs::download_dir().unwrap_or_else(|| self.storage.data_dir.join("downloads"));
-        let _ = std::fs::create_dir_all(&downloads_dir);
+        let dl_dir_shared = self.download_dir_shared.clone();
+        let initial_dl = self.storage.effective_download_dir();
+        if let Ok(mut guard) = dl_dir_shared.write() {
+            *guard = initial_dl;
+        }
+        let throttle = if self.storage.settings.background_throttling {
+            BackgroundThrottlingPolicy::Throttle
+        } else {
+            BackgroundThrottlingPolicy::Disabled
+        };
 
         let webview = WebViewBuilder::new()
             .with_bounds(rect)
             .with_visible(activate)
             .with_devtools(true)
             .with_clipboard(true)
+            .with_background_throttling(throttle)
             .with_proxy_config(ProxyConfig::Http(ProxyEndpoint {
                 host: "127.0.0.1".to_string(),
                 port: self.proxy_port.to_string(),
@@ -385,6 +434,8 @@ impl BrowserApp {
                 NewWindowResponse::Deny
             })
             .with_download_started_handler(move |url, dest| {
+                let downloads_dir = dl_dir_shared.read().unwrap().clone();
+                let _ = std::fs::create_dir_all(&downloads_dir);
                 let fname = url
                     .split('/')
                     .last()
@@ -418,6 +469,7 @@ impl BrowserApp {
             })
             .build_as_child(&self.window)
             .expect("Tab WebView oluşturulamadı");
+        let _ = webview.zoom(self.storage.settings.effective_zoom());
 
         let tab = BrowserTab {
             id: tab_id,
@@ -433,6 +485,7 @@ impl BrowserApp {
         }
         let idx = self.tabs.len() - 1;
         self.navigate_tab_idx(idx, initial_target);
+        self.save_session_tabs();
         self.layout_views();
         self.sync_chrome_bar();
     }
@@ -440,6 +493,7 @@ impl BrowserApp {
     fn close_tab_by_id(&mut self, id: usize) {
         if self.tabs.len() <= 1 {
             self.navigate_tab_idx(0, "adblock://home");
+            self.save_session_tabs();
             return;
         }
         if let Some(pos) = self.tabs.iter().position(|t| t.id == id) {
@@ -447,6 +501,7 @@ impl BrowserApp {
             if self.active_tab_idx >= self.tabs.len() {
                 self.active_tab_idx = self.tabs.len() - 1;
             }
+            self.save_session_tabs();
             self.close_popover();
             self.layout_views();
             self.sync_chrome_bar();
@@ -1042,12 +1097,95 @@ impl BrowserApp {
             "reveal_file" => {
                 reveal_in_file_manager(&env.path);
             }
+            "clear_settings_notice" => {
+                self.storage.settings_notice = None;
+                self.reload_active_internal_if_matching();
+            }
+            "clear_browsing_data" => {
+                let mut cleared = Vec::new();
+                if env.clear_history {
+                    self.storage.clear_history();
+                    cleared.push("tarama geçmişi");
+                }
+                if env.clear_cookies {
+                    let mut cookie_count = 0usize;
+                    for t in &self.tabs {
+                        if let Ok(cookies) = t.webview.cookies() {
+                            for c in cookies {
+                                if t.webview.delete_cookie(&c).is_ok() {
+                                    cookie_count += 1;
+                                }
+                            }
+                        }
+                        if t.internal_route.is_none() {
+                            let _ = t.webview.evaluate_script(
+                                "try{localStorage.clear();sessionStorage.clear();}catch(e){}",
+                            );
+                        }
+                    }
+                    cleared.push(if cookie_count > 0 {
+                        "çerezler ve oturum verileri"
+                    } else {
+                        "site çerezleri"
+                    });
+                }
+                if env.clear_downloads {
+                    self.storage.downloads.clear();
+                    self.storage.save_downloads();
+                    cleared.push("indirme kayıtları");
+                }
+                self.storage.settings_notice = Some(if cleared.is_empty() {
+                    "Temizlenecek veri türü seçilmedi.".to_string()
+                } else {
+                    format!("Temizlendi: {}.", cleared.join(", "))
+                });
+                self.reload_active_internal_if_matching();
+                self.sync_chrome_bar();
+            }
+            "open_download_dir" => {
+                let dir = self.storage.effective_download_dir();
+                open_directory_in_file_manager(&dir);
+            }
+            "open_default_browser_settings" => {
+                open_default_browser_system_settings();
+                self.storage.settings_notice = Some(
+                    "Sistem varsayılan uygulama ayarları açıldı. AdBlock Tarayıcı'yı varsayılan web tarayıcısı olarak seçebilirsiniz."
+                        .to_string(),
+                );
+                self.reload_active_internal_if_matching();
+            }
+            "reset_settings" => {
+                self.storage.reset_settings_to_defaults();
+                if let Ok(mut ab) = self.adblock.write() {
+                    ab.enabled = self.storage.settings.adblock_enabled;
+                    ab.cosmetic_enabled = self.storage.settings.cosmetic_enabled;
+                    ab.whitelisted_domains.clear();
+                }
+                self.dns_enabled
+                    .store(self.storage.settings.dns_protection, Ordering::Relaxed);
+                let dl = self.storage.effective_download_dir();
+                if let Ok(mut guard) = self.download_dir_shared.write() {
+                    *guard = dl;
+                }
+                let zoom = self.storage.settings.effective_zoom();
+                for t in &self.tabs {
+                    let _ = t.webview.zoom(zoom);
+                }
+                self.storage.settings_notice = Some(
+                    "Tüm tarayıcı ayarları varsayılan değerlere sıfırlandı."
+                        .to_string(),
+                );
+                self.layout_views();
+                self.reload_active_internal_if_matching();
+                self.sync_chrome_bar();
+            }
             _ => {}
         }
     }
 
     fn apply_setting(&mut self, key: &str, val: Option<serde_json::Value>) {
         let Some(v) = val else { return };
+        let mut reload_internal = false;
         match key {
             "adblock_enabled" => {
                 if let Some(b) = v.as_bool() {
@@ -1093,9 +1231,95 @@ impl BrowserApp {
                     self.storage.settings.search_engine = s.to_string();
                 }
             }
+            "default_zoom" => {
+                if let Some(z) = v.as_f64() {
+                    let clamped = z.clamp(0.5, 2.0);
+                    self.storage.settings.default_zoom = clamped;
+                    for t in &self.tabs {
+                        let _ = t.webview.zoom(clamped);
+                    }
+                    self.storage.settings_notice = Some(format!(
+                        "Varsayılan yakınlaştırma %{} olarak güncellendi.",
+                        (clamped * 100.0).round() as i32
+                    ));
+                    reload_internal = true;
+                }
+            }
+            "background_throttling" => {
+                if let Some(b) = v.as_bool() {
+                    self.storage.settings.background_throttling = b;
+                    self.storage.settings_notice = Some(if b {
+                        "Arka plan sekme enerji tasarrufu etkinleştirildi.".to_string()
+                    } else {
+                        "Arka plan sekme kısıtlaması kapatıldı.".to_string()
+                    });
+                    reload_internal = true;
+                }
+            }
+            "startup_mode" => {
+                if let Some(s) = v.as_str() {
+                    let mode = match s {
+                        "restore" | "custom" | "new_tab" => s,
+                        _ => "new_tab",
+                    };
+                    self.storage.settings.startup_mode = mode.to_string();
+                    self.storage.settings_notice =
+                        Some("Başlangıç davranışı kaydedildi.".to_string());
+                    reload_internal = true;
+                }
+            }
+            "home_url" => {
+                if let Some(raw) = v.as_str() {
+                    let trimmed = raw.trim();
+                    let next = if trimmed.is_empty() {
+                        "adblock://home".to_string()
+                    } else if trimmed.starts_with("adblock://")
+                        || trimmed.starts_with("http://")
+                        || trimmed.starts_with("https://")
+                    {
+                        trimmed.to_string()
+                    } else {
+                        normalize_address(trimmed, &self.storage.settings.search_engine)
+                    };
+                    self.storage.settings.home_url = next.clone();
+                    self.storage.settings_notice =
+                        Some(format!("Ana sayfa adresi güncellendi: {next}"));
+                    reload_internal = true;
+                }
+            }
+            "download_dir" => {
+                if let Some(raw) = v.as_str() {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        self.storage.settings.download_dir.clear();
+                        let eff = self.storage.effective_download_dir();
+                        if let Ok(mut guard) = self.download_dir_shared.write() {
+                            *guard = eff.clone();
+                        }
+                        self.storage.settings_notice = Some(format!(
+                            "İndirme klasörü sistem varsayılanına döndürüldü: {}",
+                            eff.display()
+                        ));
+                    } else if std::fs::create_dir_all(trimmed).is_ok() {
+                        self.storage.settings.download_dir = trimmed.to_string();
+                        if let Ok(mut guard) = self.download_dir_shared.write() {
+                            *guard = PathBuf::from(trimmed);
+                        }
+                        self.storage.settings_notice =
+                            Some(format!("İndirme klasörü güncellendi: {trimmed}"));
+                    } else {
+                        self.storage.settings_notice =
+                            Some("Belirtilen indirme klasörü oluşturulamadı/erişilemedi.".to_string());
+                    }
+                    reload_internal = true;
+                }
+            }
             _ => {}
         }
         self.storage.save_settings();
+        if reload_internal {
+            self.reload_active_internal_if_matching();
+        }
         self.sync_chrome_bar();
     }
 }
@@ -1128,6 +1352,36 @@ fn reveal_in_file_manager(path: &str) {
         if let Some(parent) = std::path::Path::new(path).parent() {
             let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
         }
+    }
+}
+
+fn open_directory_in_file_manager(dir: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(dir).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+fn open_default_browser_system_settings() {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.Desktop-Settings.extension")
+            .spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "ms-settings:defaultapps"])
+            .spawn();
     }
 }
 
@@ -1236,11 +1490,14 @@ fn main() {
         .build_as_child(&window)
         .expect("Başlatıcı oluşturulamadı");
 
+    let download_dir_shared = Arc::new(RwLock::new(storage.effective_download_dir()));
+
     let mut app = BrowserApp {
         window,
         event_proxy,
         proxy_port: local_proxy.port,
         storage,
+        download_dir_shared,
         passwords,
         adblock,
         dns_guard,
@@ -1271,6 +1528,7 @@ fn main() {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
+                app.save_session_tabs();
                 app.storage.save_settings();
                 *control_flow = ControlFlow::Exit;
             }
@@ -1415,6 +1673,7 @@ fn main() {
                     app.launch_browser_from_launcher();
                 }
                 UserEvent::CloseLauncher => {
+                    app.save_session_tabs();
                     app.storage.save_settings();
                     *control_flow = ControlFlow::Exit;
                 }
@@ -1450,12 +1709,14 @@ fn main() {
                                     let _ = app.tabs[pos].webview.evaluate_script(&js);
                                 }
                             }
+                            let _ = app.tabs[pos].webview.zoom(app.storage.settings.effective_zoom());
                             if pos == app.active_tab_idx {
                                 if let Ok(mut ab) = app.adblock.write() {
                                     ab.active_page_url = app.tabs[pos].url.clone();
                                 }
                             }
                         }
+                        app.save_session_tabs();
                         app.sync_chrome_bar();
                     }
                 }

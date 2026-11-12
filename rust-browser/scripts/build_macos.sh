@@ -46,4 +46,7 @@ cat > "$CONTENTS/Info.plist" << 'EOF'
 EOF
 
 touch "$APP_DIR"
-echo "=> Bundled: $APP_DIR"
+APP_VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VER" "$CONTENTS/Info.plist" >/dev/null 2>&1 || true
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VER" "$CONTENTS/Info.plist" >/dev/null 2>&1 || true
+echo "=> Bundled: $APP_DIR (v$APP_VER)"
