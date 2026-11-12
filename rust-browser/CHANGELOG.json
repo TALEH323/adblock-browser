@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.3.3",
+    "date": "2026-11-12",
+    "title": "Windows Video Tam Ekran Düzeltmesi",
+    "tag": "v0.3.3",
+    "changes": [
+      "Windows: video tam ekran modunda pencere ve WebView boyutunu monitöre yay"
+    ]
+  },
+  {
     "version": "0.3.2",
     "date": "2026-11-12",
     "title": "Windows WebView2 Tarayıcı Başlatma Düzeltmesi",
