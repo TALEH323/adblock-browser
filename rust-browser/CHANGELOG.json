@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.3.4",
+    "date": "2026-11-12",
+    "title": "Input Altı Otomatik Şifre Önerisi",
+    "tag": "v0.3.4",
+    "changes": [
+      "Giriş alanlarının altında kayıtlı hesapları listeleyen otomatik şifre önerisi eklendi"
+    ]
+  },
+  {
     "version": "0.3.3",
     "date": "2026-11-12",
     "title": "Windows Video Tam Ekran Düzeltmesi",
