@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.3.5",
+    "date": "2026-11-12",
+    "title": "Sekme Logoları, Hızlı Video ve Akıllı Şifre Kaydı",
+    "tag": "v0.3.5",
+    "changes": [
+      "Sekme logoları, mükerrer şifre uyarısı önleme ve YouTube hızlı başlatma"
+    ]
+  },
+  {
     "version": "0.3.4",
     "date": "2026-11-12",
     "title": "Input Altı Otomatik Şifre Önerisi",
