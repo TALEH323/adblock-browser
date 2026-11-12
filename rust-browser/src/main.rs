@@ -35,7 +35,7 @@ use tao::window::WindowBuilder;
 use wry::dpi::{LogicalPosition, LogicalSize as WrySize};
 use wry::{
     BackgroundThrottlingPolicy, NewWindowResponse, PageLoadEvent, ProxyConfig, ProxyEndpoint, Rect,
-    WebView, WebViewBuilder,
+    WebContext, WebView, WebViewBuilder,
 };
 
 const TAB_SHORTCUTS_JS: &str = r###"
@@ -157,6 +157,8 @@ struct BrowserApp {
     adblock: SharedAdBlock,
     dns_guard: Arc<DnsGuard>,
     dns_enabled: Arc<AtomicBool>,
+    ui_web_context: WebContext,
+    tab_web_context: WebContext,
     chrome_bar: WebView,
     chrome_ready: bool,
     side_panel: Option<WebView>,
@@ -373,13 +375,6 @@ impl BrowserApp {
     fn create_tab(&mut self, initial_target: &str, activate: bool) {
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
-        let ep = self.event_proxy.clone();
-        let ep_ipc = ep.clone();
-        let ep_title = ep.clone();
-        let ep_load = ep.clone();
-        let ep_new = ep.clone();
-        let ep_dl_start = ep.clone();
-        let ep_dl_done = ep.clone();
 
         let (w, h) = self.logical_size();
         let bh = self.bar_height();
@@ -394,83 +389,110 @@ impl BrowserApp {
         if let Ok(mut guard) = dl_dir_shared.write() {
             *guard = initial_dl;
         }
-        let throttle = if self.storage.settings.background_throttling {
-            BackgroundThrottlingPolicy::Throttle
-        } else {
-            BackgroundThrottlingPolicy::Disabled
+        let bg_throttling = self.storage.settings.background_throttling;
+        let proxy_port = self.proxy_port;
+        let ep = self.event_proxy.clone();
+        let window_ref = &self.window;
+
+        let build_wv = |ctx: &mut WebContext| {
+            let ep_ipc = ep.clone();
+            let ep_title = ep.clone();
+            let ep_load = ep.clone();
+            let ep_new = ep.clone();
+            let ep_dl_start = ep.clone();
+            let ep_dl_done = ep.clone();
+            let dl_dir = dl_dir_shared.clone();
+            let throttle = if bg_throttling {
+                BackgroundThrottlingPolicy::Throttle
+            } else {
+                BackgroundThrottlingPolicy::Disabled
+            };
+
+            WebViewBuilder::new_with_web_context(ctx)
+                .with_bounds(rect)
+                .with_visible(activate)
+                .with_devtools(true)
+                .with_clipboard(true)
+                .with_background_throttling(throttle)
+                .with_proxy_config(ProxyConfig::Http(ProxyEndpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: proxy_port.to_string(),
+                }))
+                .with_initialization_script(TAB_SHORTCUTS_JS)
+                .with_initialization_script(PASSWORD_INJECT_JS)
+                .with_ipc_handler(move |req| {
+                    let _ = ep_ipc.send_event(UserEvent::Ipc {
+                        tab_id: Some(tab_id),
+                        raw: req.body().clone(),
+                    });
+                })
+                .with_document_title_changed_handler(move |title| {
+                    let _ = ep_title.send_event(UserEvent::TabTitleChanged { tab_id, title });
+                })
+                .with_on_page_load_handler(move |ev, url| {
+                    let finished = matches!(ev, PageLoadEvent::Finished);
+                    let _ = ep_load.send_event(UserEvent::TabPageLoad {
+                        tab_id,
+                        finished,
+                        url,
+                    });
+                })
+                .with_new_window_req_handler(move |url, _| {
+                    if !url.is_empty() && url != "about:blank" {
+                        let _ = ep_new.send_event(UserEvent::OpenNewTab { url });
+                    }
+                    NewWindowResponse::Deny
+                })
+                .with_download_started_handler(move |url, dest| {
+                    let downloads_dir = dl_dir.read().unwrap().clone();
+                    let _ = std::fs::create_dir_all(&downloads_dir);
+                    let fname = url
+                        .split('/')
+                        .last()
+                        .and_then(|s| s.split('?').next())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("dosya.bin");
+                    let mut target: PathBuf = downloads_dir.join(fname);
+                    if target.exists() {
+                        let stem = target
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("dosya")
+                            .to_string();
+                        let ext = target
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .map(|e| format!(".{e}"))
+                            .unwrap_or_default();
+                        let ts = Local::now().format("%H%M%S");
+                        target = downloads_dir.join(format!("{stem}_{ts}{ext}"));
+                    }
+                    *dest = target.clone();
+                    let _ = ep_dl_start.send_event(UserEvent::DownloadStarted {
+                        url,
+                        save_path: target.to_string_lossy().to_string(),
+                    });
+                    true
+                })
+                .with_download_completed_handler(move |url, _path, ok| {
+                    let _ = ep_dl_done.send_event(UserEvent::DownloadFinished { url, ok });
+                })
+                .build_as_child(window_ref)
         };
 
-        let webview = WebViewBuilder::new()
-            .with_bounds(rect)
-            .with_visible(activate)
-            .with_devtools(true)
-            .with_clipboard(true)
-            .with_background_throttling(throttle)
-            .with_proxy_config(ProxyConfig::Http(ProxyEndpoint {
-                host: "127.0.0.1".to_string(),
-                port: self.proxy_port.to_string(),
-            }))
-            .with_initialization_script(TAB_SHORTCUTS_JS)
-            .with_initialization_script(PASSWORD_INJECT_JS)
-            .with_ipc_handler(move |req| {
-                let _ = ep_ipc.send_event(UserEvent::Ipc {
-                    tab_id: Some(tab_id),
-                    raw: req.body().clone(),
-                });
-            })
-            .with_document_title_changed_handler(move |title| {
-                let _ = ep_title.send_event(UserEvent::TabTitleChanged { tab_id, title });
-            })
-            .with_on_page_load_handler(move |ev, url| {
-                let finished = matches!(ev, PageLoadEvent::Finished);
-                let _ = ep_load.send_event(UserEvent::TabPageLoad {
-                    tab_id,
-                    finished,
-                    url,
-                });
-            })
-            .with_new_window_req_handler(move |url, _| {
-                if !url.is_empty() && url != "about:blank" {
-                    let _ = ep_new.send_event(UserEvent::OpenNewTab { url });
-                }
-                NewWindowResponse::Deny
-            })
-            .with_download_started_handler(move |url, dest| {
-                let downloads_dir = dl_dir_shared.read().unwrap().clone();
-                let _ = std::fs::create_dir_all(&downloads_dir);
-                let fname = url
-                    .split('/')
-                    .last()
-                    .and_then(|s| s.split('?').next())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("dosya.bin");
-                let mut target: PathBuf = downloads_dir.join(fname);
-                if target.exists() {
-                    let stem = target
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("dosya")
-                        .to_string();
-                    let ext = target
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .map(|e| format!(".{e}"))
-                        .unwrap_or_default();
-                    let ts = Local::now().format("%H%M%S");
-                    target = downloads_dir.join(format!("{stem}_{ts}{ext}"));
-                }
-                *dest = target.clone();
-                let _ = ep_dl_start.send_event(UserEvent::DownloadStarted {
-                    url,
-                    save_path: target.to_string_lossy().to_string(),
-                });
-                true
-            })
-            .with_download_completed_handler(move |url, _path, ok| {
-                let _ = ep_dl_done.send_event(UserEvent::DownloadFinished { url, ok });
-            })
-            .build_as_child(&self.window)
-            .expect("Tab WebView oluşturulamadı");
+        let webview = match build_wv(&mut self.tab_web_context) {
+            Ok(wv) => wv,
+            Err(_) => {
+                // Fallback isolated context (e.g. if another instance owns `webview_tabs` with a different proxy port)
+                let fallback_dir = self
+                    .storage
+                    .data_dir
+                    .join(format!("webview_tabs_{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&fallback_dir);
+                self.tab_web_context = WebContext::new(Some(fallback_dir));
+                build_wv(&mut self.tab_web_context).expect("Tab WebView oluşturulamadı")
+            }
+        };
         let _ = webview.zoom(self.storage.settings.effective_zoom());
 
         let tab = BrowserTab {
@@ -742,7 +764,7 @@ impl BrowserApp {
         let y = self.bar_height() - 4.0;
 
         let ep = self.event_proxy.clone();
-        if let Ok(wv) = WebViewBuilder::new()
+        if let Ok(wv) = WebViewBuilder::new_with_web_context(&mut self.ui_web_context)
             .with_transparent(true)
             .with_bounds(Rect {
                 position: LogicalPosition::new(x, y).into(),
@@ -780,7 +802,7 @@ impl BrowserApp {
             let (w, h) = self.logical_size();
             let bh = self.bar_height();
             let ep = self.event_proxy.clone();
-            if let Ok(wv) = WebViewBuilder::new()
+            if let Ok(wv) = WebViewBuilder::new_with_web_context(&mut self.ui_web_context)
                 .with_bounds(Rect {
                     position: LogicalPosition::new((w - 340.0).max(200.0), bh).into(),
                     size: WrySize::new(340.0, (h - bh).max(120.0)).into(),
@@ -1392,7 +1414,18 @@ fn open_default_browser_system_settings() {
 
 fn main() {
     let data_dir = resolve_data_dir();
+    let crash_log = data_dir.join("last_crash.log");
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = std::fs::write(&crash_log, format!("[{}] PANIC: {info}\n", Local::now()));
+    }));
+
     let storage = BrowserStorage::load(data_dir.clone());
+    let ui_ctx_dir = data_dir.join("webview_ui");
+    let tab_ctx_dir = data_dir.join("webview_tabs");
+    let _ = std::fs::create_dir_all(&ui_ctx_dir);
+    let _ = std::fs::create_dir_all(&tab_ctx_dir);
+    let mut ui_web_context = WebContext::new(Some(ui_ctx_dir));
+    let tab_web_context = WebContext::new(Some(tab_ctx_dir));
     let passwords = PasswordManager::load(&data_dir);
     let adblock: SharedAdBlock = Arc::new(RwLock::new(AdBlockService::load(
         &data_dir,
@@ -1442,7 +1475,7 @@ fn main() {
 
     let ep_bar_ipc = event_proxy.clone();
     let ep_bar_load = event_proxy.clone();
-    let chrome_bar = WebViewBuilder::new()
+    let chrome_bar = WebViewBuilder::new_with_web_context(&mut ui_web_context)
         .with_bounds(Rect {
             position: LogicalPosition::new(0.0, 0.0).into(),
             size: WrySize::new(1280.0, 110.0).into(),
@@ -1470,7 +1503,7 @@ fn main() {
     };
     let ep_ln_ipc = event_proxy.clone();
     let ep_ln_load = event_proxy.clone();
-    let launcher_webview = WebViewBuilder::new()
+    let launcher_webview = WebViewBuilder::new_with_web_context(&mut ui_web_context)
         .with_bounds(Rect {
             position: LogicalPosition::new(0.0, 0.0).into(),
             size: WrySize::new(780.0, 500.0).into(),
@@ -1507,6 +1540,8 @@ fn main() {
         adblock,
         dns_guard,
         dns_enabled,
+        ui_web_context,
+        tab_web_context,
         chrome_bar,
         chrome_ready: false,
         side_panel: None,
