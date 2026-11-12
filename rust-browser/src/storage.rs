@@ -174,16 +174,236 @@ pub const PERMISSION_INJECT_JS: &str = r##"
     };
   }
 
-  // 3. Local File System Access (File System Access API)
-  for (const fnName of ['showOpenFilePicker', 'showSaveFilePicker', 'showDirectoryPicker']) {
-    if (typeof window[fnName] === 'function') {
-      const origPicker = window[fnName].bind(window);
-      window[fnName] = async function(...args) {
-        const ok = await requestPerm('file_access');
-        if (!ok) throw new DOMException('File access permission denied', 'NotAllowedError');
-        return origPicker(...args);
+  // 3. Local File System Access (File System Access API + native polyfill for WKWebView)
+  const fsPending = new Map();
+  let nextFsReqId = 1;
+  window.__abResolveFs = (reqId, payload) => {
+    const entry = fsPending.get(reqId);
+    if (entry) {
+      fsPending.delete(reqId);
+      entry.resolve(payload);
+    }
+  };
+  function fsCall(cmd, payload) {
+    if (!window.ipc) return Promise.resolve({ ok: false, error: 'IPC unavailable' });
+    const id = nextFsReqId++;
+    return new Promise((resolve) => {
+      fsPending.set(id, { resolve });
+      try {
+        window.ipc.postMessage(JSON.stringify({ type: 'ui_cmd', cmd, id, ...(payload || {}) }));
+      } catch (_) {
+        fsPending.delete(id);
+        resolve({ ok: false, error: 'IPC failed' });
+      }
+      setTimeout(() => {
+        if (fsPending.has(id)) {
+          fsPending.delete(id);
+          resolve({ ok: false, error: 'Timeout' });
+        }
+      }, 180000);
+    });
+  }
+  function b64ToBytes(b64) {
+    const bin = atob(b64 || '');
+    const len = bin.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+  function bytesToB64(u8) {
+    let bin = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < u8.length; i += chunk) {
+      bin += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+    }
+    return btoa(bin);
+  }
+  class AbFileSystemHandle {
+    constructor(kind, rootId, relPath, name) {
+      this.kind = kind;
+      this.name = name || '';
+      this._rootId = rootId;
+      this._rel = relPath || '';
+    }
+    async isSameEntry(other) {
+      return !!(other && other._rootId === this._rootId && other._rel === this._rel && other.kind === this.kind);
+    }
+    async queryPermission() {
+      const v = window.__abSitePerms.file_access;
+      return v === true ? 'granted' : (v === false ? 'denied' : 'prompt');
+    }
+    async requestPermission() {
+      return (await requestPerm('file_access')) ? 'granted' : 'denied';
+    }
+  }
+  class AbFileSystemFileHandle extends AbFileSystemHandle {
+    constructor(rootId, relPath, name) {
+      super('file', rootId, relPath, name);
+    }
+    async getFile() {
+      const res = await fsCall('fs_read_file', { root_id: this._rootId, path: this._rel });
+      if (!res || !res.ok) throw new DOMException(res && res.error ? res.error : 'Cannot read file', 'NotReadableError');
+      const bytes = b64ToBytes(res.data_b64);
+      return new File([bytes], res.name || this.name, {
+        type: res.mime || '',
+        lastModified: res.last_modified || Date.now()
+      });
+    }
+    async createWritable() {
+      const rootId = this._rootId;
+      const rel = this._rel;
+      const chunks = [];
+      return {
+        async write(data) {
+          if (data instanceof Blob) {
+            chunks.push(new Uint8Array(await data.arrayBuffer()));
+          } else if (data instanceof ArrayBuffer) {
+            chunks.push(new Uint8Array(data));
+          } else if (ArrayBuffer.isView(data)) {
+            chunks.push(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+          } else if (typeof data === 'string') {
+            chunks.push(new TextEncoder().encode(data));
+          } else if (data && typeof data === 'object' && 'data' in data) {
+            await this.write(data.data);
+          }
+        },
+        async close() {
+          let total = 0;
+          for (const c of chunks) total += c.length;
+          const merged = new Uint8Array(total);
+          let off = 0;
+          for (const c of chunks) { merged.set(c, off); off += c.length; }
+          const res = await fsCall('fs_write_file', { root_id: rootId, path: rel, data_b64: bytesToB64(merged) });
+          if (!res || !res.ok) throw new DOMException(res && res.error ? res.error : 'Write failed', 'NotAllowedError');
+        },
+        async abort() {}
       };
     }
+  }
+  class AbFileSystemDirectoryHandle extends AbFileSystemHandle {
+    constructor(rootId, relPath, name) {
+      super('directory', rootId, relPath, name);
+    }
+    _childRel(name) {
+      return this._rel ? (this._rel + '/' + name) : name;
+    }
+    async getFileHandle(name, opts) {
+      const create = !!(opts && opts.create);
+      const res = await fsCall('fs_get_entry', { root_id: this._rootId, path: this._rel, name, entry_kind: 'file', create });
+      if (!res || !res.ok) throw new DOMException(res && res.error ? res.error : 'Not found', 'NotFoundError');
+      return new AbFileSystemFileHandle(this._rootId, this._childRel(name), name);
+    }
+    async getDirectoryHandle(name, opts) {
+      const create = !!(opts && opts.create);
+      const res = await fsCall('fs_get_entry', { root_id: this._rootId, path: this._rel, name, entry_kind: 'directory', create });
+      if (!res || !res.ok) throw new DOMException(res && res.error ? res.error : 'Not found', 'NotFoundError');
+      return new AbFileSystemDirectoryHandle(this._rootId, this._childRel(name), name);
+    }
+    async removeEntry(name, opts) {
+      const res = await fsCall('fs_remove_entry', { root_id: this._rootId, path: this._rel, name, recursive: !!(opts && opts.recursive) });
+      if (!res || !res.ok) throw new DOMException(res && res.error ? res.error : 'Remove failed', 'NotFoundError');
+    }
+    async _list() {
+      const res = await fsCall('fs_list_dir', { root_id: this._rootId, path: this._rel });
+      if (!res || !res.ok || !Array.isArray(res.entries)) return [];
+      return res.entries.map((e) => {
+        const childPath = this._childRel(e.name);
+        const h = e.kind === 'directory'
+          ? new AbFileSystemDirectoryHandle(this._rootId, childPath, e.name)
+          : new AbFileSystemFileHandle(this._rootId, childPath, e.name);
+        return [e.name, h];
+      });
+    }
+    entries() {
+      let items = null;
+      let idx = 0;
+      const self = this;
+      return {
+        async next() {
+          if (!items) items = await self._list();
+          if (idx >= items.length) return { done: true, value: undefined };
+          return { done: false, value: items[idx++] };
+        },
+        [Symbol.asyncIterator]() { return this; }
+      };
+    }
+    values() {
+      const it = this.entries();
+      return {
+        async next() {
+          const r = await it.next();
+          return r.done ? r : { done: false, value: r.value[1] };
+        },
+        [Symbol.asyncIterator]() { return this; }
+      };
+    }
+    keys() {
+      const it = this.entries();
+      return {
+        async next() {
+          const r = await it.next();
+          return r.done ? r : { done: false, value: r.value[0] };
+        },
+        [Symbol.asyncIterator]() { return this; }
+      };
+    }
+    [Symbol.asyncIterator]() {
+      return this.entries();
+    }
+  }
+  if (typeof window.FileSystemHandle === 'undefined') window.FileSystemHandle = AbFileSystemHandle;
+  if (typeof window.FileSystemFileHandle === 'undefined') window.FileSystemFileHandle = AbFileSystemFileHandle;
+  if (typeof window.FileSystemDirectoryHandle === 'undefined') window.FileSystemDirectoryHandle = AbFileSystemDirectoryHandle;
+
+  if (typeof window.showDirectoryPicker === 'function') {
+    const origDir = window.showDirectoryPicker.bind(window);
+    window.showDirectoryPicker = async function(...args) {
+      const ok = await requestPerm('file_access');
+      if (!ok) throw new DOMException('File access permission denied', 'NotAllowedError');
+      return origDir(...args);
+    };
+  } else {
+    window.showDirectoryPicker = async function() {
+      const ok = await requestPerm('file_access');
+      if (!ok) throw new DOMException('File access permission denied', 'NotAllowedError');
+      const res = await fsCall('fs_pick_dir', {});
+      if (!res || !res.ok) throw new DOMException('The user aborted a request.', 'AbortError');
+      return new AbFileSystemDirectoryHandle(res.root_id, '', res.name);
+    };
+  }
+
+  if (typeof window.showOpenFilePicker === 'function') {
+    const origOpen = window.showOpenFilePicker.bind(window);
+    window.showOpenFilePicker = async function(...args) {
+      const ok = await requestPerm('file_access');
+      if (!ok) throw new DOMException('File access permission denied', 'NotAllowedError');
+      return origOpen(...args);
+    };
+  } else {
+    window.showOpenFilePicker = async function(opts) {
+      const ok = await requestPerm('file_access');
+      if (!ok) throw new DOMException('File access permission denied', 'NotAllowedError');
+      const res = await fsCall('fs_pick_files', { multiple: !!(opts && opts.multiple) });
+      if (!res || !res.ok || !Array.isArray(res.files)) throw new DOMException('The user aborted a request.', 'AbortError');
+      return res.files.map((f) => new AbFileSystemFileHandle(f.root_id, '', f.name));
+    };
+  }
+
+  if (typeof window.showSaveFilePicker === 'function') {
+    const origSave = window.showSaveFilePicker.bind(window);
+    window.showSaveFilePicker = async function(...args) {
+      const ok = await requestPerm('file_access');
+      if (!ok) throw new DOMException('File access permission denied', 'NotAllowedError');
+      return origSave(...args);
+    };
+  } else {
+    window.showSaveFilePicker = async function(opts) {
+      const ok = await requestPerm('file_access');
+      if (!ok) throw new DOMException('File access permission denied', 'NotAllowedError');
+      const res = await fsCall('fs_save_file', { title: (opts && opts.suggestedName) || '' });
+      if (!res || !res.ok) throw new DOMException('The user aborted a request.', 'AbortError');
+      return new AbFileSystemFileHandle(res.root_id, '', res.name);
+    };
   }
 
   // 4. Geolocation

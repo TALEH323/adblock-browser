@@ -27,10 +27,12 @@ use crate::updater::{
     check_for_updates_bundle, download_and_install_update, launcher_html, LauncherProfileStats,
     ReleaseInfo, UpdateCheckBundle, UpdateCheckResult, APP_VERSION,
 };
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use chrono::Local;
 use serde::Deserialize;
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
@@ -201,6 +203,20 @@ struct IpcEnvelope {
     clear_cookies: bool,
     #[serde(default)]
     clear_downloads: bool,
+    #[serde(default)]
+    root_id: Option<u64>,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    entry_kind: String,
+    #[serde(default)]
+    create: bool,
+    #[serde(default)]
+    multiple: bool,
+    #[serde(default)]
+    recursive: bool,
+    #[serde(default)]
+    data_b64: String,
 }
 
 struct BrowserTab {
@@ -238,6 +254,8 @@ struct BrowserApp {
     next_tab_id: usize,
     pending_password: Option<(String, String, String)>,
     pending_perm: Option<(usize, String, String, u64)>,
+    fs_roots: HashMap<u64, PathBuf>,
+    next_fs_root_id: u64,
     launcher_webview: Option<WebView>,
     launcher_ready: bool,
     in_launcher: bool,
@@ -884,6 +902,52 @@ impl BrowserApp {
         }
     }
 
+    fn resolve_fs_path(
+        &self,
+        root_id: u64,
+        rel_path: &str,
+        child_name: Option<&str>,
+    ) -> Option<PathBuf> {
+        let root = self.fs_roots.get(&root_id)?;
+        let mut out = root.clone();
+        for seg in rel_path.split('/').filter(|s| !s.is_empty()) {
+            let mut comps = Path::new(seg).components();
+            match (comps.next(), comps.next()) {
+                (Some(Component::Normal(c)), None) => out.push(c),
+                _ => return None,
+            }
+        }
+        if let Some(child) = child_name {
+            if child.is_empty() || child.contains('/') || child.contains('\\') {
+                return None;
+            }
+            let mut comps = Path::new(child).components();
+            match (comps.next(), comps.next()) {
+                (Some(Component::Normal(c)), None) => out.push(c),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    fn resolve_fs_to_tab(
+        &self,
+        source_tab_id: Option<usize>,
+        req_id: usize,
+        payload: serde_json::Value,
+    ) {
+        let pos = source_tab_id
+            .and_then(|tid| self.tabs.iter().position(|t| t.id == tid))
+            .unwrap_or(self.active_tab_idx);
+        let Some(tab) = self.tabs.get(pos) else {
+            return;
+        };
+        if let Ok(json_str) = serde_json::to_string(&payload) {
+            let script = format!("window.__abResolveFs && window.__abResolveFs({req_id}, {json_str});");
+            let _ = tab.webview.evaluate_script(&script);
+        }
+    }
+
     fn push_pw_hints_to_tab(&self, tab_idx: usize) {
         let Some(tab) = self.tabs.get(tab_idx) else {
             return;
@@ -1482,6 +1546,225 @@ impl BrowserApp {
                 self.push_site_perms_to_tab(active_idx);
                 self.reload_active_internal_if_matching();
             }
+            "fs_pick_dir" => {
+                let req_id = env.id.unwrap_or(0);
+                let picked = rfd::FileDialog::new()
+                    .set_parent(&self.window)
+                    .pick_folder();
+                let payload = if let Some(dir) = picked {
+                    let name = dir
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Klasor")
+                        .to_string();
+                    let rid = self.next_fs_root_id;
+                    self.next_fs_root_id += 1;
+                    self.fs_roots.insert(rid, dir);
+                    serde_json::json!({ "ok": true, "root_id": rid, "name": name })
+                } else {
+                    serde_json::json!({ "ok": false })
+                };
+                self.resolve_fs_to_tab(source_tab_id, req_id, payload);
+            }
+            "fs_pick_files" => {
+                let req_id = env.id.unwrap_or(0);
+                let dlg = rfd::FileDialog::new().set_parent(&self.window);
+                let picked_list = if env.multiple {
+                    dlg.pick_files().unwrap_or_default()
+                } else {
+                    dlg.pick_file().into_iter().collect()
+                };
+                let payload = if picked_list.is_empty() {
+                    serde_json::json!({ "ok": false })
+                } else {
+                    let mut files = Vec::new();
+                    for f in picked_list {
+                        let name = f
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("dosya")
+                            .to_string();
+                        let rid = self.next_fs_root_id;
+                        self.next_fs_root_id += 1;
+                        self.fs_roots.insert(rid, f);
+                        files.push(serde_json::json!({ "root_id": rid, "name": name }));
+                    }
+                    serde_json::json!({ "ok": true, "files": files })
+                };
+                self.resolve_fs_to_tab(source_tab_id, req_id, payload);
+            }
+            "fs_save_file" => {
+                let req_id = env.id.unwrap_or(0);
+                let mut dlg = rfd::FileDialog::new().set_parent(&self.window);
+                if !env.title.trim().is_empty() {
+                    dlg = dlg.set_file_name(env.title.trim());
+                }
+                let payload = if let Some(path) = dlg.save_file() {
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("dosya")
+                        .to_string();
+                    let rid = self.next_fs_root_id;
+                    self.next_fs_root_id += 1;
+                    self.fs_roots.insert(rid, path);
+                    serde_json::json!({ "ok": true, "root_id": rid, "name": name })
+                } else {
+                    serde_json::json!({ "ok": false })
+                };
+                self.resolve_fs_to_tab(source_tab_id, req_id, payload);
+            }
+            "fs_list_dir" => {
+                let req_id = env.id.unwrap_or(0);
+                let payload = match env
+                    .root_id
+                    .and_then(|rid| self.resolve_fs_path(rid, &env.path, None))
+                {
+                    Some(dir) => match std::fs::read_dir(&dir) {
+                        Ok(rd) => {
+                            let mut entries = Vec::new();
+                            for item in rd.flatten() {
+                                let name = item.file_name().to_string_lossy().to_string();
+                                if name.starts_with('.') {
+                                    continue;
+                                }
+                                let is_dir = item.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                                entries.push(serde_json::json!({
+                                    "name": name,
+                                    "kind": if is_dir { "directory" } else { "file" }
+                                }));
+                            }
+                            serde_json::json!({ "ok": true, "entries": entries })
+                        }
+                        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                    },
+                    None => serde_json::json!({ "ok": false, "error": "Invalid path" }),
+                };
+                self.resolve_fs_to_tab(source_tab_id, req_id, payload);
+            }
+            "fs_get_entry" => {
+                let req_id = env.id.unwrap_or(0);
+                let payload = match env
+                    .root_id
+                    .and_then(|rid| self.resolve_fs_path(rid, &env.path, Some(&env.name)))
+                {
+                    Some(target) => {
+                        if env.entry_kind == "directory" {
+                            if !target.exists() && env.create {
+                                let _ = std::fs::create_dir_all(&target);
+                            }
+                            if target.is_dir() {
+                                serde_json::json!({ "ok": true })
+                            } else {
+                                serde_json::json!({ "ok": false, "error": "Directory not found" })
+                            }
+                        } else {
+                            if !target.exists() && env.create {
+                                let _ = std::fs::File::create(&target);
+                            }
+                            if target.is_file() {
+                                serde_json::json!({ "ok": true })
+                            } else {
+                                serde_json::json!({ "ok": false, "error": "File not found" })
+                            }
+                        }
+                    }
+                    None => serde_json::json!({ "ok": false, "error": "Invalid path" }),
+                };
+                self.resolve_fs_to_tab(source_tab_id, req_id, payload);
+            }
+            "fs_read_file" => {
+                let req_id = env.id.unwrap_or(0);
+                let payload = match env
+                    .root_id
+                    .and_then(|rid| self.resolve_fs_path(rid, &env.path, None))
+                {
+                    Some(file_path) => match std::fs::read(&file_path) {
+                        Ok(bytes) => {
+                            let name = file_path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("dosya")
+                                .to_string();
+                            let ext = file_path
+                                .extension()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("")
+                                .to_ascii_lowercase();
+                            let mime = match ext.as_str() {
+                                "csv" => "text/csv",
+                                "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                "xls" => "application/vnd.ms-excel",
+                                "json" => "application/json",
+                                "txt" => "text/plain",
+                                "pdf" => "application/pdf",
+                                "png" => "image/png",
+                                "jpg" | "jpeg" => "image/jpeg",
+                                _ => "application/octet-stream",
+                            };
+                            let last_modified = std::fs::metadata(&file_path)
+                                .and_then(|m| m.modified())
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let data_b64 = B64.encode(&bytes);
+                            serde_json::json!({
+                                "ok": true,
+                                "name": name,
+                                "mime": mime,
+                                "last_modified": last_modified,
+                                "data_b64": data_b64
+                            })
+                        }
+                        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                    },
+                    None => serde_json::json!({ "ok": false, "error": "Invalid path" }),
+                };
+                self.resolve_fs_to_tab(source_tab_id, req_id, payload);
+            }
+            "fs_write_file" => {
+                let req_id = env.id.unwrap_or(0);
+                let payload = match env
+                    .root_id
+                    .and_then(|rid| self.resolve_fs_path(rid, &env.path, None))
+                {
+                    Some(file_path) => match B64.decode(&env.data_b64) {
+                        Ok(bytes) => match std::fs::write(&file_path, &bytes) {
+                            Ok(()) => serde_json::json!({ "ok": true }),
+                            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                        },
+                        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                    },
+                    None => serde_json::json!({ "ok": false, "error": "Invalid path" }),
+                };
+                self.resolve_fs_to_tab(source_tab_id, req_id, payload);
+            }
+            "fs_remove_entry" => {
+                let req_id = env.id.unwrap_or(0);
+                let payload = match env
+                    .root_id
+                    .and_then(|rid| self.resolve_fs_path(rid, &env.path, Some(&env.name)))
+                {
+                    Some(target) => {
+                        let res = if target.is_dir() {
+                            if env.recursive {
+                                std::fs::remove_dir_all(&target)
+                            } else {
+                                std::fs::remove_dir(&target)
+                            }
+                        } else {
+                            std::fs::remove_file(&target)
+                        };
+                        match res {
+                            Ok(()) => serde_json::json!({ "ok": true }),
+                            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                        }
+                    }
+                    None => serde_json::json!({ "ok": false, "error": "Invalid path" }),
+                };
+                self.resolve_fs_to_tab(source_tab_id, req_id, payload);
+            }
             "clear_history" => {
                 self.storage.clear_history();
                 self.reload_active_internal_if_matching();
@@ -2052,6 +2335,8 @@ fn main() {
         next_tab_id: 1,
         pending_password: None,
         pending_perm: None,
+        fs_roots: HashMap::new(),
+        next_fs_root_id: 1,
         launcher_webview: Some(launcher_webview),
         launcher_ready: false,
         in_launcher: true,
