@@ -364,8 +364,13 @@ impl BrowserApp {
             let _ = lw.set_visible(false);
             drop(lw);
         }
-        self.window.set_decorations(true);
+        // `set_resizable(true)` MUST precede `set_decorations(true)` on macOS because `tao::set_decorations`
+        // snapshots `resizable` and applies `set_style_mask_async` later, which would otherwise strip `Resizable`.
         self.window.set_resizable(true);
+        self.window.set_decorations(true);
+        self.window.set_maximizable(true);
+        self.window.set_minimizable(true);
+        self.window.set_closable(true);
         self.window.set_title("AdBlock Tarayıcı");
         self.window.set_inner_size(LogicalSize::new(1280.0, 820.0));
         center_window_logical(&self.window, 1280.0, 820.0);
