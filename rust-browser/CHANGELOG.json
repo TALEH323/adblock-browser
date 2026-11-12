@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.3.6",
+    "date": "2026-11-12",
+    "title": "macOS Tam Ekran Butonu Düzeltmesi",
+    "tag": "v0.3.6",
+    "changes": [
+      "macOS tam ekran butonunun pasif kalma sorunu düzeltildi"
+    ]
+  },
+  {
     "version": "0.3.5",
     "date": "2026-11-12",
     "title": "Sekme Logoları, Hızlı Video ve Akıllı Şifre Kaydı",
