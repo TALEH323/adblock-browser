@@ -46,7 +46,7 @@ impl LocalSecurityProxy {
                         });
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(12));
+                        thread::sleep(Duration::from_millis(2));
                     }
                     Err(_) => break,
                 }
@@ -114,6 +114,8 @@ fn handle_client(
             client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")?;
             return Ok(());
         };
+        let _ = client.set_nodelay(true);
+        let _ = upstream.set_nodelay(true);
         client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
         client.set_read_timeout(None)?;
         let _ = relay_bidirectional(client, &mut upstream);
@@ -161,6 +163,8 @@ fn handle_client(
         client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")?;
         return Ok(());
     };
+    let _ = client.set_nodelay(true);
+    let _ = upstream.set_nodelay(true);
 
     let path_and_query = match u.query() {
         Some(q) => format!("{}?{}", u.path(), q),
@@ -197,16 +201,6 @@ fn should_block_host(
     if host.is_empty() || DnsGuard::is_local_or_ip(host) {
         return false;
     }
-    if dns_on {
-        let dns_res = dns_guard.check_host(host, true);
-        if !dns_res.safe {
-            let _ = events_tx.send(ProxyEvent::DnsBlocked {
-                host: host.to_string(),
-                reason: dns_res.reason,
-            });
-            return true;
-        }
-    }
     if let Ok(ab) = adblock.read() {
         let outcome = ab.should_block(check_url, "", rtype);
         if outcome.blocked {
@@ -215,6 +209,16 @@ fn should_block_host(
                 request_url: check_url.to_string(),
                 rule: outcome.rule,
             }));
+            return true;
+        }
+    }
+    if dns_on {
+        let dns_res = dns_guard.check_host(host, true);
+        if !dns_res.safe {
+            let _ = events_tx.send(ProxyEvent::DnsBlocked {
+                host: host.to_string(),
+                reason: dns_res.reason,
+            });
             return true;
         }
     }
@@ -234,7 +238,7 @@ fn relay_bidirectional(mut client: TcpStream, upstream: &mut TcpStream) -> io::R
     let mut c_read = client.try_clone()?;
     let mut u_write = upstream.try_clone()?;
     let c2u = thread::spawn(move || {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; 65536];
         while let Ok(n) = c_read.read(&mut buf) {
             if n == 0 || u_write.write_all(&buf[..n]).is_err() {
                 break;
@@ -243,7 +247,7 @@ fn relay_bidirectional(mut client: TcpStream, upstream: &mut TcpStream) -> io::R
         let _ = u_write.shutdown(std::net::Shutdown::Write);
     });
 
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; 65536];
     while let Ok(n) = upstream.read(&mut buf) {
         if n == 0 || client.write_all(&buf[..n]).is_err() {
             break;

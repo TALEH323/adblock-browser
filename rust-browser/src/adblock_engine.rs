@@ -84,8 +84,8 @@ pub const DEFAULT_RULES: &str = r#"
 ||youtube.com/youtubei/v1/player/ad_break
 ||googlevideo.com/videoplayback?*oad=
 ||googlevideo.com/videoplayback?*ctier=L
-||jnn-pa.googleapis.com^
 @@||www.gstatic.com^
+@@||jnn-pa.googleapis.com^
 @@||accounts.google.com^
 @@||fonts.googleapis.com^
 @@||fonts.gstatic.com^
@@ -166,6 +166,156 @@ pub struct AdBlockService {
     pub active_page_url: String,
     engine: Engine,
 }
+
+/// Early document-start ad & tracker hook (network interception + YouTube player JSON pruner & non-stalling skipper).
+pub const EARLY_ADBLOCK_INIT_JS: &str = r##"
+(() => {
+  if (window.__abEarlyInit) return;
+  window.__abEarlyInit = true;
+  if (!location.protocol.startsWith('http')) return;
+  if (typeof window.__abDisabled !== 'boolean') window.__abDisabled = false;
+
+  // 1. Document-start fetch / XHR path-level ad blocking + reporting
+  if (!window.__abNetHook) {
+    window.__abNetHook = true;
+    const adPatterns = [
+      'doubleclick.net', 'googlesyndication.com', 'googleadservices.com',
+      '/pagead/', '/api/stats/ads', '/ptracking', '/get_midroll_info',
+      '/youtubei/v1/player/ad_break', 'adservice.google.', '/pcs/activeview'
+    ];
+    const isAdUrl = (u) => !window.__abDisabled && typeof u === 'string' && adPatterns.some((p) => u.includes(p));
+    const reportBlocked = (rtype, url, rule) => {
+      try {
+        if (window.ipc) window.ipc.postMessage(JSON.stringify({ type: 'blocked_req', rtype, url, rule }));
+      } catch (_) {}
+    };
+
+    const origFetch = window.fetch;
+    window.fetch = function(input) {
+      const u = typeof input === 'string' ? input : (input && input.url) || '';
+      if (isAdUrl(u)) {
+        reportBlocked('fetch', u, 'in-page-ad-rule');
+        return Promise.resolve(new Response('', { status: 204, statusText: 'No Content' }));
+      }
+      return origFetch.apply(this, arguments);
+    };
+
+    const origOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(_method, url) {
+      this.__abUrl = String(url || '');
+      return origOpen.apply(this, arguments);
+    };
+    const origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function() {
+      if (isAdUrl(this.__abUrl)) {
+        reportBlocked('xhr', this.__abUrl, 'in-page-ad-rule');
+        try { this.abort(); } catch (_) {}
+        return;
+      }
+      return origSend.apply(this, arguments);
+    };
+  }
+
+  // 2. YouTube document-start JSON pruner, instant ad CSS, and MSE-safe skipper
+  const h = location.hostname.toLowerCase();
+  if ((h.endsWith('youtube.com') || h.endsWith('youtu.be')) && !window.__abYtInit) {
+    window.__abYtInit = true;
+    const pruneKeys = ['adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams'];
+    const pruneObj = (obj, depth = 0) => {
+      if (window.__abDisabled || !obj || typeof obj !== 'object' || depth > 4) return obj;
+      for (const k of pruneKeys) {
+        if (k in obj) delete obj[k];
+      }
+      if (obj.playerResponse && typeof obj.playerResponse === 'object') {
+        pruneObj(obj.playerResponse, depth + 1);
+      }
+      if (obj.args && typeof obj.args === 'object' && obj.args.raw_player_response) {
+        pruneObj(obj.args.raw_player_response, depth + 1);
+      }
+      return obj;
+    };
+
+    let _ytInitPr;
+    try {
+      if ('ytInitialPlayerResponse' in window) {
+        _ytInitPr = pruneObj(window.ytInitialPlayerResponse);
+      }
+      Object.defineProperty(window, 'ytInitialPlayerResponse', {
+        configurable: true,
+        get() { return _ytInitPr; },
+        set(v) { _ytInitPr = pruneObj(v); }
+      });
+    } catch (_) {}
+
+    const origParse = JSON.parse;
+    JSON.parse = function(text, reviver) {
+      const parsed = origParse.call(this, text, reviver);
+      return window.__abDisabled ? parsed : pruneObj(parsed);
+    };
+    const origRespJson = Response.prototype.json;
+    Response.prototype.json = function() {
+      return origRespJson.call(this).then((d) => (window.__abDisabled ? d : pruneObj(d)));
+    };
+
+    const injectEarlyYtCss = () => {
+      if (window.__abDisabled || document.getElementById('__ab_yt_early_css')) return;
+      const st = document.createElement('style');
+      st.id = '__ab_yt_early_css';
+      st.textContent = [
+        'ytd-ad-slot-renderer, ytd-banner-promo-renderer, ytd-promoted-sparkles-web-renderer,',
+        'ytd-display-ad-renderer, ytd-companion-slot-renderer, ytd-player-legacy-desktop-watch-ads-renderer,',
+        'ytd-action-companion-ad-renderer, ytd-in-feed-ad-layout-renderer, #masthead-ad, #player-ads,',
+        '.ytp-ad-module, .ytp-ad-overlay-container, .ytp-ad-player-overlay, .ytp-ad-image-overlay, .video-ads',
+        '{ display: none !important; }',
+        '.html5-video-player.ad-showing video, .html5-video-player.ad-interrupting video',
+        '{ opacity: 0 !important; }'
+      ].join(' ');
+      (document.head || document.documentElement).appendChild(st);
+    };
+    if (document.documentElement) injectEarlyYtCss();
+    else document.addEventListener('DOMContentLoaded', injectEarlyYtCss, { once: true });
+
+    let wasMuted = null;
+    const skipTick = () => {
+      if (window.__abDisabled) return;
+      try {
+        const player = document.querySelector('#movie_player');
+        const video = document.querySelector('video.html5-main-video');
+        const adShowing = !!(player && (player.classList.contains('ad-showing') || player.classList.contains('ad-interrupting')));
+        if (adShowing) {
+          const skip = document.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-ad-skip-button-slot button, button[id^="skip-button"]');
+          if (skip) skip.click();
+          if (video) {
+            if (wasMuted === null) wasMuted = video.muted;
+            video.muted = true;
+            if (video.playbackRate < 16) video.playbackRate = 16;
+            const sk = video.seekable;
+            const seekEnd = sk && sk.length ? sk.end(sk.length - 1) : 0;
+            if (isFinite(video.duration) && video.duration > 0.3 && seekEnd >= video.duration - 0.5 && video.currentTime < video.duration - 0.25) {
+              video.currentTime = video.duration - 0.1;
+            }
+          }
+        } else if (video) {
+          if (wasMuted !== null) {
+            video.muted = wasMuted;
+            wasMuted = null;
+          }
+          if (video.playbackRate > 4) video.playbackRate = 1;
+        }
+      } catch (_) {}
+    };
+    setInterval(skipTick, 150);
+    const attachSkipObserver = () => {
+      if (window.__abYtMo || !window.MutationObserver || !document.documentElement) return;
+      window.__abYtMo = true;
+      const mo = new MutationObserver(skipTick);
+      mo.observe(document.documentElement, { attributes: true, subtree: true, attributeFilter: ['class'] });
+    };
+    if (document.documentElement) attachSkipObserver();
+    else document.addEventListener('DOMContentLoaded', attachSkipObserver, { once: true });
+  }
+})();
+"##;
 
 impl AdBlockService {
     pub fn load(
@@ -346,10 +496,13 @@ impl AdBlockService {
         results
     }
 
-    /// Generates per-URL cosmetic CSS + YouTube ad-pruner/skipper script for injection.
+    /// Generates per-URL cosmetic CSS injection script when AdBlock is active.
     pub fn build_page_script(&self, page_url: &str) -> String {
-        if !self.enabled || !self.cosmetic_enabled || self.is_site_whitelisted(page_url) {
-            return String::new();
+        if !self.enabled || self.is_site_whitelisted(page_url) {
+            return "window.__abDisabled = true; const s = document.getElementById('__ab_yt_early_css'); if (s) s.remove();".to_string();
+        }
+        if !self.cosmetic_enabled {
+            return "window.__abDisabled = false;".to_string();
         }
         let resources = self.engine.url_cosmetic_resources(page_url);
         let mut selectors: Vec<String> = resources.hide_selectors.into_iter().collect();
@@ -363,11 +516,10 @@ impl AdBlockService {
             )
         };
         let css_json = serde_json::to_string(&css_block).unwrap_or_else(|_| "\"\"".to_string());
-        let yt_host = extract_host(page_url).contains("youtube.com");
-
-        let mut js = format!(
+        format!(
             r#"
 (() => {{
+  window.__abDisabled = false;
   const css = {css_json};
   if (css) {{
     const applyCss = () => {{
@@ -380,94 +532,9 @@ impl AdBlockService {
     if (document.documentElement) applyCss();
     else document.addEventListener('DOMContentLoaded', applyCss, {{ once: true }});
   }}
-
-  // In-page fetch / XHR path-level ad blocking + reporting to Rust UI
-  if (!window.__abNetHook) {{
-    window.__abNetHook = true;
-    const adPatterns = [
-      'doubleclick.net', 'googlesyndication.com', 'googleadservices.com',
-      '/pagead/', '/api/stats/ads', '/ptracking', '/get_midroll_info',
-      '/youtubei/v1/player/ad_break', 'adservice.google.'
-    ];
-    const isAdUrl = (u) => typeof u === 'string' && adPatterns.some((p) => u.includes(p));
-    const reportBlocked = (rtype, url, rule) => {{
-      try {{
-        if (window.ipc) window.ipc.postMessage(JSON.stringify({{ type: 'blocked_req', rtype, url, rule }}));
-      }} catch (_) {{}}
-    }};
-
-    const origFetch = window.fetch;
-    window.fetch = function(input, init) {{
-      const u = typeof input === 'string' ? input : (input && input.url) || '';
-      if (isAdUrl(u)) {{
-        reportBlocked('fetch', u, 'in-page-ad-rule');
-        return Promise.resolve(new Response('', {{ status: 204, statusText: 'No Content' }}));
-      }}
-      return origFetch.apply(this, arguments);
-    }};
-
-    const origOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(method, url) {{
-      this.__abUrl = String(url || '');
-      return origOpen.apply(this, arguments);
-    }};
-    const origSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.send = function() {{
-      if (isAdUrl(this.__abUrl)) {{
-        reportBlocked('xhr', this.__abUrl, 'in-page-ad-rule');
-        try {{ this.abort(); }} catch (_) {{}}
-        return;
-      }}
-      return origSend.apply(this, arguments);
-    }};
-  }}
+}})();
 "#
-        );
-
-        if yt_host {
-            js.push_str(
-                r#"
-  // YouTube Ad JSON Pruner + Auto Skipper
-  if (!window.__abYtInit) {
-    window.__abYtInit = true;
-    const pruneKeys = ['adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams'];
-    const pruneObj = (obj) => {
-      if (obj && typeof obj === 'object') {
-        for (const k of pruneKeys) {
-          if (k in obj) delete obj[k];
-        }
-      }
-      return obj;
-    };
-    const origParse = JSON.parse;
-    JSON.parse = function(text, reviver) {
-      return pruneObj(origParse.call(this, text, reviver));
-    };
-    const origRespJson = Response.prototype.json;
-    Response.prototype.json = function() {
-      return origRespJson.call(this).then(pruneObj);
-    };
-    setInterval(() => {
-      try {
-        const player = document.querySelector('#movie_player');
-        const video = document.querySelector('video.html5-main-video');
-        if (player && player.classList.contains('ad-showing') && video) {
-          video.muted = true;
-          if (isFinite(video.duration) && video.duration > 0) {
-            video.currentTime = video.duration;
-          }
-          const skip = document.querySelector('.ytp-ad-skip-button, .ytp-skip-ad-button, .ytp-ad-skip-button-modern');
-          if (skip) skip.click();
-        }
-      } catch (_) {}
-    }, 350);
-  }
-"#,
-            );
-        }
-
-        js.push_str("\n})();\n");
-        js
+        )
     }
 }
 
@@ -497,6 +564,16 @@ mod tests {
             "image",
         );
         assert!(!allowed.blocked);
+
+        // BotGuard / WebPO endpoint required for fast YouTube video playback must not be blocked
+        let webpo = svc.should_block(
+            "https://jnn-pa.googleapis.com/$rpc/google.internal.waa.v1.Waa/Create",
+            "https://www.youtube.com/watch?v=1",
+            "xhr",
+        );
+        assert!(!webpo.blocked);
+        assert!(EARLY_ADBLOCK_INIT_JS.contains("ytInitialPlayerResponse"));
+        assert!(EARLY_ADBLOCK_INIT_JS.contains("video.seekable"));
 
         svc.set_site_whitelisted("www.youtube.com", true);
         let after_wl = svc.should_block(

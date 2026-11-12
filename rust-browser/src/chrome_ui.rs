@@ -11,6 +11,9 @@ pub struct TabUiItem {
     pub title: String,
     pub active: bool,
     pub blocked_count: usize,
+    pub favicon: String,
+    pub host: String,
+    pub is_internal: bool,
 }
 
 #[derive(Serialize)]
@@ -81,6 +84,13 @@ pub fn chrome_bar_html() -> &'static str {
   }
   .tab:hover { background: rgba(255,255,255,0.06); color: var(--text); }
   .tab.active { background: var(--bar); color: var(--text); font-weight: 500; }
+  .tab-icon {
+    width: 16px; height: 16px; border-radius: 3px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; overflow: hidden;
+  }
+  .tab-icon img {
+    width: 16px; height: 16px; object-fit: contain; display: block; border-radius: 3px;
+  }
   .tab-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
   .tab-close {
     width: 17px; height: 17px; border-radius: 50%; border: none; background: transparent;
@@ -224,23 +234,70 @@ pub fn chrome_bar_html() -> &'static str {
       const inp = document.getElementById('url-input');
       inp.focus(); inp.select();
     };
+    const INTERNAL_TAB_SVG = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#8ab4f8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>';
+    const GLOBE_TAB_SVG = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#9aa0a6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>';
+    function syncTabIcon(iconWrap, t) {
+      const s2 = t.host ? ('https://www.google.com/s2/favicons?domain=' + encodeURIComponent(t.host) + '&sz=32') : '';
+      const desired = t.is_internal ? '' : (t.favicon || s2);
+      const key = t.is_internal ? 'internal' : ('ext:' + desired + '|' + (t.host || ''));
+      if (iconWrap.dataset.key === key) return;
+      iconWrap.dataset.key = key;
+      iconWrap.innerHTML = '';
+      if (t.is_internal) {
+        iconWrap.innerHTML = INTERNAL_TAB_SVG;
+        return;
+      }
+      if (!desired) {
+        iconWrap.innerHTML = GLOBE_TAB_SVG;
+        return;
+      }
+      const img = document.createElement('img');
+      img.alt = '';
+      img.referrerPolicy = 'no-referrer';
+      img.src = desired;
+      img.onerror = () => {
+        if (s2 && !img.dataset.triedS2 && img.src !== s2) {
+          img.dataset.triedS2 = '1';
+          img.src = s2;
+        } else {
+          iconWrap.innerHTML = GLOBE_TAB_SVG;
+        }
+      };
+      iconWrap.appendChild(img);
+    }
     window.__updateBarState = (st) => {
       const tl = document.getElementById('tabs-list');
-      tl.innerHTML = '';
+      const existing = new Map();
+      for (const node of Array.from(tl.children)) {
+        if (node.dataset && node.dataset.tabId) existing.set(Number(node.dataset.tabId), node);
+      }
+      const keep = new Set();
       for (const t of st.tabs) {
-        const div = document.createElement('div');
+        keep.add(t.id);
+        let div = existing.get(t.id);
+        if (!div) {
+          div = document.createElement('div');
+          div.dataset.tabId = String(t.id);
+          const ico = document.createElement('span');
+          ico.className = 'tab-icon';
+          const sp = document.createElement('span');
+          sp.className = 'tab-title';
+          const cl = document.createElement('button');
+          cl.className = 'tab-close';
+          cl.textContent = '×';
+          cl.onclick = (e) => { e.stopPropagation(); uiCmd('close_tab', { id: Number(div.dataset.tabId) }); };
+          div.appendChild(ico);
+          div.appendChild(sp);
+          div.appendChild(cl);
+        }
         div.className = 'tab' + (t.active ? ' active' : '');
         div.onclick = () => uiCmd('switch_tab', { id: t.id });
-        const sp = document.createElement('span');
-        sp.className = 'tab-title';
-        sp.textContent = t.title || 'Yeni Sekme';
-        const cl = document.createElement('button');
-        cl.className = 'tab-close';
-        cl.textContent = '×';
-        cl.onclick = (e) => { e.stopPropagation(); uiCmd('close_tab', { id: t.id }); };
-        div.appendChild(sp);
-        div.appendChild(cl);
+        syncTabIcon(div.querySelector('.tab-icon'), t);
+        div.querySelector('.tab-title').textContent = t.title || 'Yeni Sekme';
         tl.appendChild(div);
+      }
+      for (const [id, node] of existing.entries()) {
+        if (!keep.has(id)) node.remove();
       }
 
       const inp = document.getElementById('url-input');
@@ -781,6 +838,9 @@ mod tests {
 
         let sp = render_side_panel_html("history", &storage);
         assert!(sp.contains("Geçmiş"));
+        let bar = chrome_bar_html();
+        assert!(bar.contains("syncTabIcon"));
+        assert!(bar.contains(".tab-icon"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

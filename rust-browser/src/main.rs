@@ -9,7 +9,9 @@ mod proxy;
 mod storage;
 mod updater;
 
-use crate::adblock_engine::{extract_host, AdBlockService, BlockedItem, SharedAdBlock};
+use crate::adblock_engine::{
+    extract_host, AdBlockService, BlockedItem, SharedAdBlock, EARLY_ADBLOCK_INIT_JS,
+};
 use crate::chrome_ui::{
     chrome_bar_html, render_popover_html, render_side_panel_html, BarUiState, PopoverKind,
     TabUiItem,
@@ -52,6 +54,52 @@ const TAB_SHORTCUTS_JS: &str = r###"
     };
     document.addEventListener('fullscreenchange', syncFs, true);
     document.addEventListener('webkitfullscreenchange', syncFs, true);
+
+    if (location.protocol.startsWith('http')) {
+      let lastFav = '';
+      const pickFavicon = () => {
+        if (!window.ipc) return;
+        const sels = [
+          'link[rel="icon"]',
+          'link[rel="shortcut icon"]',
+          'link[rel~="icon"]',
+          'link[rel="apple-touch-icon"]'
+        ];
+        let href = '';
+        for (const s of sels) {
+          const el = document.querySelector(s);
+          if (el && el.getAttribute('href')) {
+            href = el.getAttribute('href').trim();
+            break;
+          }
+        }
+        let resolved = '';
+        if (href) {
+          try { resolved = new URL(href, location.href).href; } catch (e) {}
+        } else {
+          resolved = location.origin + '/favicon.ico';
+        }
+        if (resolved && resolved !== lastFav) {
+          lastFav = resolved;
+          window.ipc.postMessage(JSON.stringify({ type: 'ui_cmd', cmd: 'tab_favicon', url: resolved }));
+        }
+      };
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', pickFavicon, { once: true });
+      } else {
+        pickFavicon();
+      }
+      window.addEventListener('load', pickFavicon, { once: true });
+      const headTarget = document.head || document.documentElement;
+      if (headTarget && window.MutationObserver) {
+        let favTimer = null;
+        const mo = new MutationObserver(() => {
+          if (favTimer) return;
+          favTimer = setTimeout(() => { favTimer = null; pickFavicon(); }, 250);
+        });
+        mo.observe(headTarget, { childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'rel'] });
+      }
+    }
   }
   window.addEventListener('keydown', (e) => {
     const mod = e.metaKey || e.ctrlKey;
@@ -153,6 +201,7 @@ struct BrowserTab {
     id: usize,
     title: String,
     url: String,
+    favicon_url: String,
     internal_route: Option<String>,
     blocked_items: Vec<BlockedItem>,
     webview: WebView,
@@ -483,6 +532,7 @@ impl BrowserApp {
                     port: proxy_port.to_string(),
                 }))
                 .with_initialization_script(TAB_SHORTCUTS_JS)
+                .with_initialization_script(EARLY_ADBLOCK_INIT_JS)
                 .with_initialization_script(PASSWORD_INJECT_JS)
                 .with_ipc_handler(move |req| {
                     let _ = ep_ipc.send_event(UserEvent::Ipc {
@@ -563,6 +613,7 @@ impl BrowserApp {
             id: tab_id,
             title: "Yeni Sekme".to_string(),
             url: "adblock://home".to_string(),
+            favicon_url: String::new(),
             internal_route: Some("home".to_string()),
             blocked_items: Vec::new(),
             webview,
@@ -632,6 +683,7 @@ impl BrowserApp {
             let t = &mut self.tabs[idx];
             t.internal_route = Some(route_name.to_string());
             t.url = format!("adblock://{route_name}");
+            t.favicon_url.clear();
             t.title = match route_name {
                 "settings" => "Ayarlar",
                 "downloads" => "İndirilenler",
@@ -675,6 +727,7 @@ impl BrowserApp {
                 let t = &mut self.tabs[idx];
                 t.internal_route = None;
                 t.url = target_url;
+                t.favicon_url.clear();
                 t.title = "Güvenlik Uyarısı".to_string();
                 let _ = t.webview.load_html(&html);
                 self.sync_chrome_bar();
@@ -684,6 +737,9 @@ impl BrowserApp {
 
         let t = &mut self.tabs[idx];
         t.internal_route = None;
+        if extract_host(&t.url) != host {
+            t.favicon_url.clear();
+        }
         t.url = target_url.clone();
         t.blocked_items.clear();
         let _ = t.webview.load_url(&target_url);
@@ -768,11 +824,31 @@ impl BrowserApp {
                 .tabs
                 .iter()
                 .enumerate()
-                .map(|(i, t)| TabUiItem {
-                    id: t.id,
-                    title: t.title.clone(),
-                    active: i == self.active_tab_idx,
-                    blocked_count: t.blocked_items.len(),
+                .map(|(i, t)| {
+                    let tab_internal = t.internal_route.is_some();
+                    let tab_host = if tab_internal {
+                        String::new()
+                    } else {
+                        extract_host(&t.url)
+                    };
+                    let favicon = if tab_internal {
+                        String::new()
+                    } else if !t.favicon_url.is_empty() {
+                        t.favicon_url.clone()
+                    } else if !tab_host.is_empty() && t.url.starts_with("http") {
+                        format!("https://www.google.com/s2/favicons?domain={tab_host}&sz=32")
+                    } else {
+                        String::new()
+                    };
+                    TabUiItem {
+                        id: t.id,
+                        title: t.title.clone(),
+                        active: i == self.active_tab_idx,
+                        blocked_count: t.blocked_items.len(),
+                        favicon,
+                        host: tab_host,
+                        is_internal: tab_internal,
+                    }
                 })
                 .collect(),
             url: active.url.clone(),
@@ -961,6 +1037,9 @@ impl BrowserApp {
         if env.kind == "pw_capture" {
             if self.storage.settings.password_saving_enabled
                 && !self.passwords.is_never_save(&env.origin)
+                && !self
+                    .passwords
+                    .is_already_saved(&env.origin, &env.username, &env.password)
             {
                 self.pending_password = Some((env.origin, env.username, env.password));
                 self.open_popover("passwords", None);
@@ -978,6 +1057,23 @@ impl BrowserApp {
                     .unwrap_or(true);
                 if from_active {
                     self.set_video_fullscreen(env.enabled);
+                }
+            }
+            "tab_favicon" => {
+                let raw = env.url.trim();
+                let valid = (raw.starts_with("https://")
+                    || raw.starts_with("http://")
+                    || raw.starts_with("data:image/"))
+                    && raw.len() <= 65_536;
+                if valid {
+                    if let Some(id) = source_tab_id {
+                        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                            if t.internal_route.is_none() && t.favicon_url != raw {
+                                t.favicon_url = raw.to_string();
+                                self.sync_chrome_bar();
+                            }
+                        }
+                    }
                 }
             }
             "resize_popover" => {
@@ -1091,6 +1187,14 @@ impl BrowserApp {
                         ab.whitelisted_domains.iter().cloned().collect();
                     self.storage.settings.whitelisted_domains.sort();
                     self.storage.save_settings();
+                    if let Some(t) = self.tabs.get(active_idx) {
+                        if t.internal_route.is_none() {
+                            let js = ab.build_page_script(&t.url);
+                            if !js.is_empty() {
+                                let _ = t.webview.evaluate_script(&js);
+                            }
+                        }
+                    }
                 }
                 self.sync_chrome_bar();
                 self.open_popover("adblock", None);
@@ -1907,10 +2011,27 @@ fn main() {
                     finished,
                     url,
                 } => {
-                    if finished {
+                    if !finished {
+                        if url.starts_with("http") {
+                            if let Some(pos) = app.tabs.iter().position(|t| t.id == tab_id) {
+                                app.tabs[pos].internal_route = None;
+                                if extract_host(&url) != extract_host(&app.tabs[pos].url) {
+                                    app.tabs[pos].favicon_url.clear();
+                                }
+                                app.tabs[pos].url = url.clone();
+                                app.sync_chrome_bar();
+                            }
+                        }
+                    } else {
                         if let Some(pos) = app.tabs.iter().position(|t| t.id == tab_id) {
+                            if app.tabs[pos].internal_route.is_some() && url.starts_with("http") {
+                                app.tabs[pos].internal_route = None;
+                            }
                             let is_internal = app.tabs[pos].internal_route.is_some();
                             if !is_internal && url.starts_with("http") {
+                                if extract_host(&url) != extract_host(&app.tabs[pos].url) {
+                                    app.tabs[pos].favicon_url.clear();
+                                }
                                 app.tabs[pos].url = url.clone();
                                 let title = app.tabs[pos].title.clone();
                                 app.storage.record_history(&url, &title);

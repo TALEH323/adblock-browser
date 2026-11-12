@@ -33,13 +33,21 @@ const SINKHOLE_IPS: &[&str] = &["0.0.0.0", "127.0.0.1", "::", "::1", "127.0.0.2"
 pub struct DnsGuard {
     cache: RwLock<HashMap<String, DnsCheckResult>>,
     ttl: Duration,
+    agent: ureq::Agent,
+    doh_backoff_until: RwLock<Option<Instant>>,
 }
 
 impl DnsGuard {
     pub fn new() -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_millis(800))
+            .timeout(Duration::from_millis(1200))
+            .build();
         Self {
             cache: RwLock::new(HashMap::new()),
             ttl: Duration::from_secs(300),
+            agent,
+            doh_backoff_until: RwLock::new(None),
         }
     }
 
@@ -99,65 +107,83 @@ impl DnsGuard {
     }
 
     fn query_doh_or_system(&self, host: &str) -> DnsCheckResult {
-        let doh_url = format!(
-            "https://security.cloudflare-dns.com/dns-query?name={}&type=A",
-            host
-        );
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(2))
-            .build();
-        if let Ok(resp) = agent
-            .get(&doh_url)
-            .set("Accept", "application/dns-json")
-            .call()
-        {
-            if let Ok(raw_body) = resp.into_string() {
-                if let Ok(body) = serde_json::from_str::<DohResponse>(&raw_body) {
-                let comment_text = body.comment.unwrap_or_default().join(" ").to_lowercase();
-                let answers: Vec<String> = body
-                    .answer
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|a| a.data)
-                    .collect();
+        let skip_doh = self
+            .doh_backoff_until
+            .read()
+            .ok()
+            .and_then(|g| *g)
+            .map(|until| Instant::now() < until)
+            .unwrap_or(false);
 
-                if comment_text.contains("blocked") || comment_text.contains("filtered") {
-                    return DnsCheckResult {
-                        host: host.to_string(),
-                        safe: false,
-                        reason: "Cloudflare Security DNS bu alan adını zararlı/oltalama olarak engelledi."
-                            .to_string(),
-                        resolved_ips: answers,
-                        checked_at: Instant::now(),
-                    };
+        if !skip_doh {
+            let doh_url = format!(
+                "https://security.cloudflare-dns.com/dns-query?name={}&type=A",
+                host
+            );
+            match self
+                .agent
+                .get(&doh_url)
+                .set("Accept", "application/dns-json")
+                .call()
+            {
+                Ok(resp) => {
+                    if let Ok(raw_body) = resp.into_string() {
+                        if let Ok(body) = serde_json::from_str::<DohResponse>(&raw_body) {
+                            let comment_text =
+                                body.comment.unwrap_or_default().join(" ").to_lowercase();
+                            let answers: Vec<String> = body
+                                .answer
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter_map(|a| a.data)
+                                .collect();
+
+                            if comment_text.contains("blocked") || comment_text.contains("filtered")
+                            {
+                                return DnsCheckResult {
+                                    host: host.to_string(),
+                                    safe: false,
+                                    reason: "Cloudflare Security DNS bu alan adını zararlı/oltalama olarak engelledi.".to_string(),
+                                    resolved_ips: answers,
+                                    checked_at: Instant::now(),
+                                };
+                            }
+                            if body.status == Some(3) {
+                                return DnsCheckResult {
+                                    host: host.to_string(),
+                                    safe: false,
+                                    reason: "Alan adı çözümlenemedi (NXDOMAIN).".to_string(),
+                                    resolved_ips: Vec::new(),
+                                    checked_at: Instant::now(),
+                                };
+                            }
+                            if answers.iter().any(|ip| SINKHOLE_IPS.contains(&ip.as_str())) {
+                                return DnsCheckResult {
+                                    host: host.to_string(),
+                                    safe: false,
+                                    reason:
+                                        "DNS sinkhole adresi (0.0.0.0 / 127.0.0.1) döndü.".to_string(),
+                                    resolved_ips: answers,
+                                    checked_at: Instant::now(),
+                                };
+                            }
+                            if !answers.is_empty() {
+                                return DnsCheckResult {
+                                    host: host.to_string(),
+                                    safe: true,
+                                    reason: "Cloudflare DoH (1.1.1.2) doğrulaması temiz."
+                                        .to_string(),
+                                    resolved_ips: answers,
+                                    checked_at: Instant::now(),
+                                };
+                            }
+                        }
+                    }
                 }
-                if body.status == Some(3) {
-                    return DnsCheckResult {
-                        host: host.to_string(),
-                        safe: false,
-                        reason: "Alan adı çözümlenemedi (NXDOMAIN).".to_string(),
-                        resolved_ips: Vec::new(),
-                        checked_at: Instant::now(),
-                    };
-                }
-                if answers.iter().any(|ip| SINKHOLE_IPS.contains(&ip.as_str())) {
-                    return DnsCheckResult {
-                        host: host.to_string(),
-                        safe: false,
-                        reason: "DNS sinkhole adresi (0.0.0.0 / 127.0.0.1) döndü.".to_string(),
-                        resolved_ips: answers,
-                        checked_at: Instant::now(),
-                    };
-                }
-                if !answers.is_empty() {
-                    return DnsCheckResult {
-                        host: host.to_string(),
-                        safe: true,
-                        reason: "Cloudflare DoH (1.1.1.2) doğrulaması temiz.".to_string(),
-                        resolved_ips: answers,
-                        checked_at: Instant::now(),
-                    };
-                }
+                Err(_) => {
+                    if let Ok(mut g) = self.doh_backoff_until.write() {
+                        *g = Some(Instant::now() + Duration::from_secs(30));
+                    }
                 }
             }
         }

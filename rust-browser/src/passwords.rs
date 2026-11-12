@@ -302,6 +302,16 @@ impl PasswordManager {
             })
             .collect()
     }
+
+    pub fn is_already_saved(&self, origin: &str, username: &str, password: &str) -> bool {
+        if password.is_empty() {
+            return false;
+        }
+        let uname = username.trim();
+        self.for_origin(origin).iter().any(|c| {
+            c.password == password && (uname.is_empty() || c.username.eq_ignore_ascii_case(uname))
+        })
+    }
 }
 
 fn find_col(headers: &[String], candidates: &[&str]) -> Option<usize> {
@@ -923,5 +933,19 @@ mod tests {
         assert!(PASSWORD_INJECT_JS.contains("attachShadow({ mode: 'closed' })"));
         assert!(PASSWORD_INJECT_JS.contains("__adblockFillPassword"));
         assert!(PASSWORD_INJECT_JS.contains("dispatchEvent(new Event('change'"));
+    }
+
+    #[test]
+    fn suppresses_save_prompt_when_credential_already_saved() {
+        let tmp = std::env::temp_dir().join(format!("ab_test_pw_dup_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let mut pm = PasswordManager::load(&tmp);
+        pm.add_or_update("github.com", "Ali@Example.com", "secret-123");
+
+        assert!(pm.is_already_saved("www.github.com", "ali@example.com", "secret-123"));
+        assert!(pm.is_already_saved("github.com", "", "secret-123"));
+        assert!(!pm.is_already_saved("github.com", "ali@example.com", "new-pass-456"));
+        assert!(!pm.is_already_saved("github.com", "other@example.com", "secret-123"));
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
