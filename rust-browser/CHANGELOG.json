@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.3.1",
+    "date": "2026-11-12",
+    "title": "Windows Güncelleme & Konsol Düzeltmesi",
+    "tag": "v0.3.1",
+    "changes": [
+      "Windows: güncelleme sırasında dosya kilidi (OS error 32) ve terminal penceresi düzeltmesi"
+    ]
+  },
+  {
     "version": "0.3.0",
     "date": "2026-11-12",
     "title": "Site Önizlemeli Yer İmleri & Gelişmiş Ayarlar",
