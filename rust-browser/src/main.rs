@@ -31,7 +31,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use chrono::Local;
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
@@ -254,8 +254,6 @@ struct BrowserApp {
     next_tab_id: usize,
     pending_password: Option<(String, String, String)>,
     pending_perm: Option<(usize, String, String, u64)>,
-    fs_roots: HashMap<u64, PathBuf>,
-    next_fs_root_id: u64,
     launcher_webview: Option<WebView>,
     launcher_ready: bool,
     in_launcher: bool,
@@ -902,14 +900,25 @@ impl BrowserApp {
         }
     }
 
+    fn tab_host_for(&self, source_tab_id: Option<usize>) -> String {
+        let pos = source_tab_id
+            .and_then(|tid| self.tabs.iter().position(|t| t.id == tid))
+            .unwrap_or(self.active_tab_idx);
+        self.tabs
+            .get(pos)
+            .map(|t| normalize_perm_host(&extract_host(&Self::live_tab_url(t))))
+            .unwrap_or_default()
+    }
+
     fn resolve_fs_path(
         &self,
+        host: &str,
         root_id: u64,
         rel_path: &str,
         child_name: Option<&str>,
     ) -> Option<PathBuf> {
-        let root = self.fs_roots.get(&root_id)?;
-        let mut out = root.clone();
+        let root = self.storage.get_fs_root(host, root_id)?;
+        let mut out = root;
         for seg in rel_path.split('/').filter(|s| !s.is_empty()) {
             let mut comps = Path::new(seg).components();
             match (comps.next(), comps.next()) {
@@ -1243,7 +1252,7 @@ impl BrowserApp {
             return;
         }
 
-        if env.kind == "perm_request" {
+        if env.kind == "perm_request" || env.cmd == "perm_request" {
             let req_id = env.id.unwrap_or(0) as u64;
             let req_tab_id = source_tab_id.or_else(|| self.tabs.get(self.active_tab_idx).map(|t| t.id));
             let host = if !env.host.is_empty() {
@@ -1546,8 +1555,23 @@ impl BrowserApp {
                 self.push_site_perms_to_tab(active_idx);
                 self.reload_active_internal_if_matching();
             }
+            "fs_check_root" => {
+                let req_id = env.id.unwrap_or(0);
+                let host = self.tab_host_for(source_tab_id);
+                let ok = env
+                    .root_id
+                    .and_then(|rid| self.storage.get_fs_root(&host, rid))
+                    .is_some();
+                let perm = self.storage.get_site_permission(&host, "file_access");
+                self.resolve_fs_to_tab(
+                    source_tab_id,
+                    req_id,
+                    serde_json::json!({ "ok": ok, "perm": perm }),
+                );
+            }
             "fs_pick_dir" => {
                 let req_id = env.id.unwrap_or(0);
+                let host = self.tab_host_for(source_tab_id);
                 let picked = rfd::FileDialog::new()
                     .set_parent(&self.window)
                     .pick_folder();
@@ -1557,9 +1581,7 @@ impl BrowserApp {
                         .and_then(|s| s.to_str())
                         .unwrap_or("Klasor")
                         .to_string();
-                    let rid = self.next_fs_root_id;
-                    self.next_fs_root_id += 1;
-                    self.fs_roots.insert(rid, dir);
+                    let rid = self.storage.register_fs_root(&host, &dir);
                     serde_json::json!({ "ok": true, "root_id": rid, "name": name })
                 } else {
                     serde_json::json!({ "ok": false })
@@ -1568,6 +1590,7 @@ impl BrowserApp {
             }
             "fs_pick_files" => {
                 let req_id = env.id.unwrap_or(0);
+                let host = self.tab_host_for(source_tab_id);
                 let dlg = rfd::FileDialog::new().set_parent(&self.window);
                 let picked_list = if env.multiple {
                     dlg.pick_files().unwrap_or_default()
@@ -1584,9 +1607,7 @@ impl BrowserApp {
                             .and_then(|s| s.to_str())
                             .unwrap_or("dosya")
                             .to_string();
-                        let rid = self.next_fs_root_id;
-                        self.next_fs_root_id += 1;
-                        self.fs_roots.insert(rid, f);
+                        let rid = self.storage.register_fs_root(&host, &f);
                         files.push(serde_json::json!({ "root_id": rid, "name": name }));
                     }
                     serde_json::json!({ "ok": true, "files": files })
@@ -1595,6 +1616,7 @@ impl BrowserApp {
             }
             "fs_save_file" => {
                 let req_id = env.id.unwrap_or(0);
+                let host = self.tab_host_for(source_tab_id);
                 let mut dlg = rfd::FileDialog::new().set_parent(&self.window);
                 if !env.title.trim().is_empty() {
                     dlg = dlg.set_file_name(env.title.trim());
@@ -1605,9 +1627,7 @@ impl BrowserApp {
                         .and_then(|s| s.to_str())
                         .unwrap_or("dosya")
                         .to_string();
-                    let rid = self.next_fs_root_id;
-                    self.next_fs_root_id += 1;
-                    self.fs_roots.insert(rid, path);
+                    let rid = self.storage.register_fs_root(&host, &path);
                     serde_json::json!({ "ok": true, "root_id": rid, "name": name })
                 } else {
                     serde_json::json!({ "ok": false })
@@ -1616,9 +1636,10 @@ impl BrowserApp {
             }
             "fs_list_dir" => {
                 let req_id = env.id.unwrap_or(0);
+                let host = self.tab_host_for(source_tab_id);
                 let payload = match env
                     .root_id
-                    .and_then(|rid| self.resolve_fs_path(rid, &env.path, None))
+                    .and_then(|rid| self.resolve_fs_path(&host, rid, &env.path, None))
                 {
                     Some(dir) => match std::fs::read_dir(&dir) {
                         Ok(rd) => {
@@ -1644,9 +1665,10 @@ impl BrowserApp {
             }
             "fs_get_entry" => {
                 let req_id = env.id.unwrap_or(0);
+                let host = self.tab_host_for(source_tab_id);
                 let payload = match env
                     .root_id
-                    .and_then(|rid| self.resolve_fs_path(rid, &env.path, Some(&env.name)))
+                    .and_then(|rid| self.resolve_fs_path(&host, rid, &env.path, Some(&env.name)))
                 {
                     Some(target) => {
                         if env.entry_kind == "directory" {
@@ -1675,9 +1697,10 @@ impl BrowserApp {
             }
             "fs_read_file" => {
                 let req_id = env.id.unwrap_or(0);
+                let host = self.tab_host_for(source_tab_id);
                 let payload = match env
                     .root_id
-                    .and_then(|rid| self.resolve_fs_path(rid, &env.path, None))
+                    .and_then(|rid| self.resolve_fs_path(&host, rid, &env.path, None))
                 {
                     Some(file_path) => match std::fs::read(&file_path) {
                         Ok(bytes) => {
@@ -1725,9 +1748,10 @@ impl BrowserApp {
             }
             "fs_write_file" => {
                 let req_id = env.id.unwrap_or(0);
+                let host = self.tab_host_for(source_tab_id);
                 let payload = match env
                     .root_id
-                    .and_then(|rid| self.resolve_fs_path(rid, &env.path, None))
+                    .and_then(|rid| self.resolve_fs_path(&host, rid, &env.path, None))
                 {
                     Some(file_path) => match B64.decode(&env.data_b64) {
                         Ok(bytes) => match std::fs::write(&file_path, &bytes) {
@@ -1742,9 +1766,10 @@ impl BrowserApp {
             }
             "fs_remove_entry" => {
                 let req_id = env.id.unwrap_or(0);
+                let host = self.tab_host_for(source_tab_id);
                 let payload = match env
                     .root_id
-                    .and_then(|rid| self.resolve_fs_path(rid, &env.path, Some(&env.name)))
+                    .and_then(|rid| self.resolve_fs_path(&host, rid, &env.path, Some(&env.name)))
                 {
                     Some(target) => {
                         let res = if target.is_dir() {
@@ -2335,8 +2360,6 @@ fn main() {
         next_tab_id: 1,
         pending_password: None,
         pending_perm: None,
-        fs_roots: HashMap::new(),
-        next_fs_root_id: 1,
         launcher_webview: Some(launcher_webview),
         launcher_ready: false,
         in_launcher: true,

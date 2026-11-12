@@ -220,6 +220,7 @@ pub const PERMISSION_INJECT_JS: &str = r##"
   }
   class AbFileSystemHandle {
     constructor(kind, rootId, relPath, name) {
+      this.__abFsHandle = true;
       this.kind = kind;
       this.name = name || '';
       this._rootId = rootId;
@@ -229,6 +230,10 @@ pub const PERMISSION_INJECT_JS: &str = r##"
       return !!(other && other._rootId === this._rootId && other._rel === this._rel && other.kind === this.kind);
     }
     async queryPermission() {
+      const res = await fsCall('fs_check_root', { root_id: this._rootId });
+      if (!res || !res.ok) return 'denied';
+      if (res.perm === true) return 'granted';
+      if (res.perm === false) return 'denied';
       const v = window.__abSitePerms.file_access;
       return v === true ? 'granted' : (v === false ? 'denied' : 'prompt');
     }
@@ -354,6 +359,52 @@ pub const PERMISSION_INJECT_JS: &str = r##"
   if (typeof window.FileSystemHandle === 'undefined') window.FileSystemHandle = AbFileSystemHandle;
   if (typeof window.FileSystemFileHandle === 'undefined') window.FileSystemFileHandle = AbFileSystemFileHandle;
   if (typeof window.FileSystemDirectoryHandle === 'undefined') window.FileSystemDirectoryHandle = AbFileSystemDirectoryHandle;
+
+  function hydrateFsHandles(val, seen) {
+    if (!val || typeof val !== 'object') return val;
+    if (val instanceof AbFileSystemHandle) return val;
+    if (val.__abFsHandle === true && val._rootId) {
+      return val.kind === 'directory'
+        ? new AbFileSystemDirectoryHandle(val._rootId, val._rel || '', val.name || '')
+        : new AbFileSystemFileHandle(val._rootId, val._rel || '', val.name || '');
+    }
+    if (Array.isArray(val)) {
+      for (let i = 0; i < val.length; i++) val[i] = hydrateFsHandles(val[i], seen);
+      return val;
+    }
+    const proto = Object.getPrototypeOf(val);
+    if (proto === Object.prototype || proto === null) {
+      if (!seen) seen = new WeakSet();
+      if (seen.has(val)) return val;
+      seen.add(val);
+      for (const k of Object.keys(val)) {
+        val[k] = hydrateFsHandles(val[k], seen);
+      }
+    }
+    return val;
+  }
+  try {
+    if (window.IDBRequest) {
+      const desc = Object.getOwnPropertyDescriptor(IDBRequest.prototype, 'result');
+      if (desc && desc.get) {
+        const origGet = desc.get;
+        Object.defineProperty(IDBRequest.prototype, 'result', {
+          configurable: true,
+          get() { return hydrateFsHandles(origGet.call(this)); }
+        });
+      }
+    }
+    if (window.IDBCursorWithValue) {
+      const desc = Object.getOwnPropertyDescriptor(IDBCursorWithValue.prototype, 'value');
+      if (desc && desc.get) {
+        const origGet = desc.get;
+        Object.defineProperty(IDBCursorWithValue.prototype, 'value', {
+          configurable: true,
+          get() { return hydrateFsHandles(origGet.call(this)); }
+        });
+      }
+    }
+  } catch (_) {}
 
   if (typeof window.showDirectoryPicker === 'function') {
     const origDir = window.showDirectoryPicker.bind(window);
@@ -518,6 +569,20 @@ pub struct BrowserSettings {
     pub download_dir: String,
     #[serde(default)]
     pub site_permissions: BTreeMap<String, SitePermissionEntry>,
+    #[serde(default)]
+    pub fs_roots: BTreeMap<u64, StoredFsRoot>,
+    #[serde(default = "default_next_fs_id")]
+    pub next_fs_root_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredFsRoot {
+    pub host: String,
+    pub path: String,
+}
+
+fn default_next_fs_id() -> u64 {
+    1
 }
 
 fn default_true() -> bool {
@@ -569,6 +634,8 @@ impl Default for BrowserSettings {
             background_throttling: true,
             download_dir: String::new(),
             site_permissions: BTreeMap::new(),
+            fs_roots: BTreeMap::new(),
+            next_fs_root_id: 1,
         }
     }
 }
@@ -694,6 +761,44 @@ impl BrowserStorage {
         };
         let _ = fs::create_dir_all(&dir);
         dir
+    }
+
+    pub fn register_fs_root(&mut self, host: &str, path: &std::path::Path) -> u64 {
+        let norm_host = normalize_perm_host(host);
+        let path_str = path.to_string_lossy().to_string();
+        if let Some((&existing_id, _)) = self
+            .settings
+            .fs_roots
+            .iter()
+            .find(|(_, r)| r.host == norm_host && r.path == path_str)
+        {
+            return existing_id;
+        }
+        let id = self.settings.next_fs_root_id.max(1);
+        self.settings.next_fs_root_id = id + 1;
+        self.settings.fs_roots.insert(
+            id,
+            StoredFsRoot {
+                host: norm_host,
+                path: path_str,
+            },
+        );
+        self.save_settings();
+        id
+    }
+
+    pub fn get_fs_root(&self, host: &str, root_id: u64) -> Option<PathBuf> {
+        let norm_host = normalize_perm_host(host);
+        let entry = self.settings.fs_roots.get(&root_id)?;
+        if !entry.host.is_empty() && entry.host != norm_host {
+            return None;
+        }
+        let p = PathBuf::from(&entry.path);
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
     }
 
     pub fn reset_settings_to_defaults(&mut self) {
