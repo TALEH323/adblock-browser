@@ -33,7 +33,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: AdBlockBrowser-Windows-Setup
-          path: rust-browser/dist/installer/AdBlockBrowser-Setup-0.1.0-x64.exe
+          path: rust-browser/dist/installer/*.exe
       - uses: actions/upload-artifact@v4
         with:
           name: AdBlockBrowser-Windows
@@ -54,7 +54,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: AdBlockBrowser-macOS-DMG
-          path: rust-browser/dist/AdBlockBrowser-0.1.0-macOS.dmg
+          path: rust-browser/dist/AdBlockBrowser-*-macOS.dmg
       - uses: actions/upload-artifact@v4
         with:
           name: AdBlockBrowser-macOS

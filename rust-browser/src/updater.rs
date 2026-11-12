@@ -510,37 +510,57 @@ where
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(info.asset_size);
 
-    let mut reader = resp.into_reader();
-    let mut out = File::create(&dest_path).map_err(|e| format!("Dosya yazılamadı: {e}"))?;
-    let mut buf = [0u8; 32 * 1024];
-    let mut downloaded: u64 = 0;
-    let mut last_pct: u8 = 5;
+    let pid = std::process::id();
+    let part_path = std::env::temp_dir().join(format!("{file_name}.{pid}.part"));
+    {
+        let mut reader = resp.into_reader();
+        let mut out =
+            File::create(&part_path).map_err(|e| format!("Dosya yazılamadı: {e}"))?;
+        let mut buf = [0u8; 32 * 1024];
+        let mut downloaded: u64 = 0;
+        let mut last_pct: u8 = 5;
 
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| format!("Okuma hatası: {e}"))?;
-        if n == 0 {
-            break;
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| format!("Okuma hatası: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n])
+                .map_err(|e| format!("Disk yazma hatası: {e}"))?;
+            downloaded += n as u64;
+            let pct = if content_len > 0 {
+                ((downloaded * 90) / content_len).min(95) as u8 + 5
+            } else {
+                50
+            };
+            if pct != last_pct {
+                last_pct = pct;
+                let mb = downloaded as f64 / (1024.0 * 1024.0);
+                on_progress(pct, &format!("İndiriliyor... {mb:.1} MB"));
+            }
         }
-        out.write_all(&buf[..n])
-            .map_err(|e| format!("Disk yazma hatası: {e}"))?;
-        downloaded += n as u64;
-        let pct = if content_len > 0 {
-            ((downloaded * 90) / content_len).min(95) as u8 + 5
-        } else {
-            50
-        };
-        if pct != last_pct {
-            last_pct = pct;
-            let mb = downloaded as f64 / (1024.0 * 1024.0);
-            on_progress(pct, &format!("İndiriliyor... {mb:.1} MB"));
-        }
+        let _ = out.flush();
+        let _ = out.sync_all();
+        // `out` drops here so the OS file handle is fully released before launching the installer.
     }
-    let _ = out.flush();
-    on_progress(98, "Kurulum başlatılıyor...");
 
-    apply_downloaded_package(&dest_path)
+    let final_path = {
+        let _ = std::fs::remove_file(&dest_path);
+        if std::fs::rename(&part_path, &dest_path).is_ok() {
+            dest_path
+        } else {
+            let unique_path = std::env::temp_dir().join(format!("upd_{pid}_{file_name}"));
+            let _ = std::fs::remove_file(&unique_path);
+            std::fs::rename(&part_path, &unique_path)
+                .map_err(|e| format!("Güncelleme dosyası hazırlanamadı: {e}"))?;
+            unique_path
+        }
+    };
+
+    on_progress(98, "Kurulum başlatılıyor...");
+    apply_downloaded_package(&final_path)
 }
 
 fn apply_downloaded_package(pkg_path: &Path) -> Result<bool, String> {
@@ -553,10 +573,45 @@ fn apply_downloaded_package(pkg_path: &Path) -> Result<bool, String> {
     #[cfg(target_os = "windows")]
     {
         if lower.ends_with(".exe") {
-            Command::new(pkg_path)
-                .spawn()
-                .map_err(|e| format!("Kurulum çalıştırılamadı: {e}"))?;
-            return Ok(true);
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+            let mut last_err = None;
+            for attempt in 0..20 {
+                match Command::new(pkg_path).arg("/CLOSEAPPLICATIONS").spawn() {
+                    Ok(_) => return Ok(true),
+                    Err(e) if e.raw_os_error() == Some(32) && attempt < 19 => {
+                        // Windows Defender or filesystem filter may briefly lock freshly written .exe
+                        last_err = Some(e);
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    Err(e) if e.raw_os_error() == Some(740) => {
+                        Command::new("powershell")
+                            .args([
+                                "-NoProfile",
+                                "-WindowStyle",
+                                "Hidden",
+                                "-Command",
+                                "Start-Process -FilePath $env:AB_PKG -ArgumentList '/CLOSEAPPLICATIONS'",
+                            ])
+                            .env("AB_PKG", pkg_path)
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .spawn()
+                            .map_err(|e2| format!("Kurulum yönetici izniyle başlatılamadı: {e2}"))?;
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            return Err(format!(
+                "Kurulum çalıştırılamadı: {}",
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "bilinmeyen hata".to_string())
+            ));
         }
         let _ = Command::new("explorer")
             .arg(format!("/select,{}", pkg_path.display()))

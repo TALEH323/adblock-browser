@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod adblock_engine;
 mod chrome_ui;
 mod dns_guard;
@@ -1379,8 +1381,11 @@ fn open_default_browser_system_settings() {
     }
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "ms-settings:defaultapps"])
+            .args(["/C", "start", "", "ms-settings:defaultapps"])
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn();
     }
 }
@@ -1637,7 +1642,12 @@ fn main() {
                     app.updating_now = false;
                     match res {
                         Ok(true) => {
+                            app.save_session_tabs();
                             app.storage.save_settings();
+                            app.launcher_webview.take();
+                            app.tabs.clear();
+                            app.popover.take();
+                            app.side_panel.take();
                             *control_flow = ControlFlow::Exit;
                         }
                         Ok(false) => {
