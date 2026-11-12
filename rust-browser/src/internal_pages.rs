@@ -427,6 +427,52 @@ fn render_settings(storage: &BrowserStorage) -> String {
         http_rows = r###"<div class="empty">HTTP istisnası tanımlanmış site yok.</div>"###.to_string();
     }
 
+    let mut perm_rows = String::new();
+    for (host, entry) in &s.site_permissions {
+        let mut pills = String::new();
+        for (key, label) in [
+            ("notifications", "Bildirimler"),
+            ("microphone", "Mikrofon"),
+            ("camera", "Kamera"),
+            ("file_access", "Yerel Dosyalar"),
+            ("geolocation", "Konum"),
+            ("clipboard", "Pano"),
+        ] {
+            if let Some(allowed) = entry.get(key) {
+                let state = if allowed { "İzinli" } else { "Engelli" };
+                let color = if allowed { "#81c995" } else { "#f28b82" };
+                pills.push_str(&format!(
+                    r###"<span style="display:inline-flex;align-items:center;gap:6px;margin-right:10px;font-size:12px;"><span style="color:{color};font-weight:600;">{label}: {state}</span><select onchange="sendCmd('set_site_perm', {{host:'{}', perm:'{key}', val:this.value}})"><option value="ask">Sıfırla</option><option value="allow"{}>İzin Ver</option><option value="block"{}>Engelle</option></select></span>"###,
+                    attr(host),
+                    if allowed { " selected" } else { "" },
+                    if !allowed { " selected" } else { "" },
+                ));
+            }
+        }
+        if !pills.is_empty() {
+            perm_rows.push_str(&format!(
+                r###"<div class="row"><div class="row-info"><div class="row-title">{}</div><div class="row-sub" style="margin-top:4px;">{pills}</div></div>
+                <button class="btn-danger" onclick="sendCmd('clear_site_perms', {{host:'{}'}})">Temizle</button></div>"###,
+                txt(host),
+                attr(host),
+            ));
+        }
+    }
+    let clear_all_btn = if !perm_rows.is_empty() {
+        r###"<button class="btn-danger" onclick="sendCmd('clear_site_perms', {host:''})">Tüm İzinleri Sıfırla</button>"###
+    } else {
+        ""
+    };
+    if perm_rows.is_empty() {
+        perm_rows = r###"<div class="empty">Henüz kayıtlı site izni yok.</div>"###.to_string();
+    }
+    let site_perms_html = format!(
+        r###"<div class="card">
+          <div class="row" style="border-bottom:none;padding-top:0;"><div class="card-title" style="margin-bottom:0;">Site İzinleri (Bildirim, Mikrofon, Kamera, Dosya, Konum, Pano)</div>{clear_all_btn}</div>
+          {perm_rows}
+        </div>"###
+    );
+
     let zoom_opts = [75, 85, 90, 100, 110, 125, 150]
         .iter()
         .map(|pct| {
@@ -568,6 +614,7 @@ fn render_settings(storage: &BrowserStorage) -> String {
           <div class="card-title">HTTP İstisnaları (Güvensiz Bağlantıya İzin Verilen Siteler)</div>
           {http_rows}
         </div>
+        {site_perms_html}
         "###,
         chk(s.adblock_enabled),
         chk(s.cosmetic_enabled),

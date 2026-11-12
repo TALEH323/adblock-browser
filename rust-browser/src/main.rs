@@ -19,13 +19,17 @@ use crate::chrome_ui::{
 use crate::dns_guard::DnsGuard;
 use crate::passwords::{PasswordManager, PASSWORD_INJECT_JS};
 use crate::proxy::{LocalSecurityProxy, ProxyEvent};
-use crate::storage::{resolve_data_dir, BrowserStorage, DownloadEntry};
+use crate::storage::{
+    normalize_perm_host, resolve_data_dir, BrowserStorage, DownloadEntry, SitePermissionEntry,
+    PERMISSION_INJECT_JS,
+};
 use crate::updater::{
     check_for_updates_bundle, download_and_install_update, launcher_html, LauncherProfileStats,
     ReleaseInfo, UpdateCheckBundle, UpdateCheckResult, APP_VERSION,
 };
 use chrono::Local;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
@@ -38,8 +42,8 @@ use tao::window::Fullscreen;
 use tao::window::WindowBuilder;
 use wry::dpi::{LogicalPosition, LogicalSize as WrySize};
 use wry::{
-    BackgroundThrottlingPolicy, NewWindowResponse, PageLoadEvent, ProxyConfig, ProxyEndpoint, Rect,
-    WebContext, WebView, WebViewBuilder,
+    BackgroundThrottlingPolicy, NewWindowResponse, PageLoadEvent, PermissionKind,
+    PermissionResponse, ProxyConfig, ProxyEndpoint, Rect, WebContext, WebView, WebViewBuilder,
 };
 
 const TAB_SHORTCUTS_JS: &str = r###"
@@ -150,6 +154,8 @@ struct IpcEnvelope {
     #[serde(default)]
     pop_kind: String,
     #[serde(default)]
+    perm: String,
+    #[serde(default)]
     mode: String,
     #[serde(default)]
     force_open: bool,
@@ -213,6 +219,7 @@ struct BrowserApp {
     proxy_port: u16,
     storage: BrowserStorage,
     download_dir_shared: Arc<RwLock<PathBuf>>,
+    site_perms_shared: Arc<RwLock<BTreeMap<String, SitePermissionEntry>>>,
     passwords: PasswordManager,
     adblock: SharedAdBlock,
     dns_guard: Arc<DnsGuard>,
@@ -230,6 +237,7 @@ struct BrowserApp {
     active_tab_idx: usize,
     next_tab_id: usize,
     pending_password: Option<(String, String, String)>,
+    pending_perm: Option<(usize, String, String, u64)>,
     launcher_webview: Option<WebView>,
     launcher_ready: bool,
     in_launcher: bool,
@@ -535,6 +543,8 @@ impl BrowserApp {
         if let Ok(mut guard) = dl_dir_shared.write() {
             *guard = initial_dl;
         }
+        let perms_shared = self.site_perms_shared.clone();
+        let ab_for_perm = self.adblock.clone();
         let bg_throttling = self.storage.settings.background_throttling;
         let proxy_port = self.proxy_port;
         let ep = self.event_proxy.clone();
@@ -548,6 +558,8 @@ impl BrowserApp {
             let ep_dl_start = ep.clone();
             let ep_dl_done = ep.clone();
             let dl_dir = dl_dir_shared.clone();
+            let perms_shared_wv = perms_shared.clone();
+            let ab_for_perm_wv = ab_for_perm.clone();
             let throttle = if bg_throttling {
                 BackgroundThrottlingPolicy::Throttle
             } else {
@@ -567,6 +579,35 @@ impl BrowserApp {
                 .with_initialization_script(TAB_SHORTCUTS_JS)
                 .with_initialization_script(EARLY_ADBLOCK_INIT_JS)
                 .with_initialization_script(PASSWORD_INJECT_JS)
+                .with_initialization_script(PERMISSION_INJECT_JS)
+                .with_permission_handler(move |kind| {
+                    let key = match kind {
+                        PermissionKind::Notifications => Some("notifications"),
+                        PermissionKind::Microphone => Some("microphone"),
+                        PermissionKind::Camera => Some("camera"),
+                        PermissionKind::FileSystemAccess => Some("file_access"),
+                        PermissionKind::Geolocation => Some("geolocation"),
+                        PermissionKind::ClipboardRead => Some("clipboard"),
+                        _ => None,
+                    };
+                    if let Some(k) = key {
+                        let page_url = ab_for_perm_wv
+                            .read()
+                            .map(|ab| ab.active_page_url.clone())
+                            .unwrap_or_default();
+                        let host = normalize_perm_host(&extract_host(&page_url));
+                        if !host.is_empty() {
+                            if let Ok(guard) = perms_shared_wv.read() {
+                                match guard.get(&host).and_then(|e| e.get(k)) {
+                                    Some(true) => return PermissionResponse::Allow,
+                                    Some(false) => return PermissionResponse::Deny,
+                                    None => {}
+                                }
+                            }
+                        }
+                    }
+                    PermissionResponse::Default
+                })
                 .with_ipc_handler(move |req| {
                     let _ = ep_ipc.send_event(UserEvent::Ipc {
                         tab_id: Some(tab_id),
@@ -804,6 +845,45 @@ impl BrowserApp {
             .unwrap_or_else(|| tab.url.clone())
     }
 
+    fn sync_site_perms_shared(&self) {
+        if let Ok(mut guard) = self.site_perms_shared.write() {
+            *guard = self.storage.settings.site_permissions.clone();
+        }
+    }
+
+    fn push_site_perms_to_tab(&self, tab_idx: usize) {
+        let Some(tab) = self.tabs.get(tab_idx) else {
+            return;
+        };
+        if tab.internal_route.is_some() {
+            return;
+        }
+        let live_url = Self::live_tab_url(tab);
+        if !live_url.starts_with("http") {
+            return;
+        }
+        let host = normalize_perm_host(&extract_host(&live_url));
+        let entry = self
+            .storage
+            .settings
+            .site_permissions
+            .get(&host)
+            .cloned()
+            .unwrap_or_default();
+        let map = serde_json::json!({
+            "notifications": entry.notifications,
+            "microphone": entry.microphone,
+            "camera": entry.camera,
+            "file_access": entry.file_access,
+            "geolocation": entry.geolocation,
+            "clipboard": entry.clipboard,
+        });
+        if let Ok(json_str) = serde_json::to_string(&map) {
+            let script = format!("window.__abSetSitePerms && window.__abSetSitePerms({json_str});");
+            let _ = tab.webview.evaluate_script(&script);
+        }
+    }
+
     fn push_pw_hints_to_tab(&self, tab_idx: usize) {
         let Some(tab) = self.tabs.get(tab_idx) else {
             return;
@@ -940,15 +1020,32 @@ impl BrowserApp {
                 ab: &ab,
                 blocked_items: &active.blocked_items,
             }),
-            "security" => render_popover_html(PopoverKind::Security {
-                host: &host,
-                url: &active.url,
-                is_secure,
-                https_only: self.storage.settings.https_only,
-                dns_on: self.storage.settings.dns_protection,
-                http_allowed: !host.is_empty() && self.storage.is_http_allowed(&host),
-                dns_res: dns_cached.as_ref(),
-            }),
+            "security" => {
+                let norm = normalize_perm_host(&host);
+                let perms = self.storage.settings.site_permissions.get(&norm);
+                render_popover_html(PopoverKind::Security {
+                    host: &host,
+                    url: &active.url,
+                    is_secure,
+                    https_only: self.storage.settings.https_only,
+                    dns_on: self.storage.settings.dns_protection,
+                    http_allowed: !host.is_empty() && self.storage.is_http_allowed(&host),
+                    dns_res: dns_cached.as_ref(),
+                    perms,
+                })
+            }
+            "perm_prompt" => {
+                let (p_host, p_perm, p_id) = self
+                    .pending_perm
+                    .as_ref()
+                    .map(|(_, h, p, id)| (h.as_str(), p.as_str(), *id))
+                    .unwrap_or((host.as_str(), "notifications", 0));
+                render_popover_html(PopoverKind::PermissionPrompt {
+                    host: p_host,
+                    perm: p_perm,
+                    req_id: p_id,
+                })
+            }
             "downloads" => render_popover_html(PopoverKind::Downloads {
                 downloads: &self.storage.downloads,
             }),
@@ -976,7 +1073,9 @@ impl BrowserApp {
 
         let (win_w, _) = self.logical_size();
         let right_edge = anchor_right.unwrap_or((win_w as i32) - 16) as f64;
-        let x = if kind_name == "security" {
+        let x = if kind_name == "perm_prompt" && anchor_right.is_none() {
+            116.0_f64.clamp(8.0, (win_w - pop_w as f64 - 8.0).max(8.0))
+        } else if kind_name == "security" {
             (right_edge - 34.0).clamp(8.0, (win_w - pop_w as f64 - 8.0).max(8.0))
         } else {
             (right_edge - pop_w as f64).clamp(8.0, (win_w - pop_w as f64 - 8.0).max(8.0))
@@ -1076,6 +1175,38 @@ impl BrowserApp {
             {
                 self.pending_password = Some((env.origin, env.username, env.password));
                 self.open_popover("passwords", None);
+            }
+            return;
+        }
+
+        if env.kind == "perm_request" {
+            let req_id = env.id.unwrap_or(0) as u64;
+            let req_tab_id = source_tab_id.or_else(|| self.tabs.get(self.active_tab_idx).map(|t| t.id));
+            let host = if !env.host.is_empty() {
+                normalize_perm_host(&env.host)
+            } else {
+                self.tabs
+                    .get(self.active_tab_idx)
+                    .map(|t| normalize_perm_host(&extract_host(&Self::live_tab_url(t))))
+                    .unwrap_or_default()
+            };
+            if host.is_empty() || env.perm.is_empty() {
+                return;
+            }
+            if let Some(decision) = self.storage.get_site_permission(&host, &env.perm) {
+                if let Some(tid) = req_tab_id {
+                    if let Some(pos) = self.tabs.iter().position(|t| t.id == tid) {
+                        let perm_json =
+                            serde_json::to_string(&env.perm).unwrap_or_else(|_| "\"\"".into());
+                        let js = format!(
+                            "window.__abResolvePerm && window.__abResolvePerm({req_id}, {decision}, {perm_json});"
+                        );
+                        let _ = self.tabs[pos].webview.evaluate_script(&js);
+                    }
+                }
+            } else if let Some(tid) = req_tab_id {
+                self.pending_perm = Some((tid, host, env.perm, req_id));
+                self.open_popover("perm_prompt", None);
             }
             return;
         }
@@ -1285,6 +1416,71 @@ impl BrowserApp {
             "allow_http_once" => {
                 self.storage.set_http_allowed(&env.host, true);
                 self.navigate_tab_idx(active_idx, &env.url);
+            }
+            "perm_decide" => {
+                let req_id = env.id.unwrap_or(0) as u64;
+                let pending = self.pending_perm.take();
+                let target_tab_id = pending.as_ref().map(|(tid, _, _, _)| *tid);
+                let host = if !env.host.is_empty() {
+                    env.host.clone()
+                } else {
+                    pending
+                        .as_ref()
+                        .map(|(_, h, _, _)| h.clone())
+                        .unwrap_or_default()
+                };
+                let perm = if !env.perm.is_empty() {
+                    env.perm.clone()
+                } else {
+                    pending
+                        .as_ref()
+                        .map(|(_, _, p, _)| p.clone())
+                        .unwrap_or_default()
+                };
+                if !host.is_empty() && !perm.is_empty() {
+                    self.storage
+                        .set_site_permission(&host, &perm, Some(env.allowed));
+                    self.sync_site_perms_shared();
+                }
+                self.close_popover();
+                if let Some(pos) = target_tab_id
+                    .and_then(|tid| self.tabs.iter().position(|t| t.id == tid))
+                    .or_else(|| self.tabs.get(active_idx).map(|_| active_idx))
+                {
+                    self.push_site_perms_to_tab(pos);
+                    let perm_json =
+                        serde_json::to_string(&perm).unwrap_or_else(|_| "\"\"".into());
+                    let js = format!(
+                        "window.__abResolvePerm && window.__abResolvePerm({req_id}, {}, {perm_json});",
+                        env.allowed
+                    );
+                    let _ = self.tabs[pos].webview.evaluate_script(&js);
+                }
+            }
+            "set_site_perm" => {
+                let decision = match env.val.as_ref().and_then(|v| v.as_str()) {
+                    Some("allow") => Some(true),
+                    Some("block") => Some(false),
+                    _ => None,
+                };
+                if !env.host.is_empty() && !env.perm.is_empty() {
+                    self.storage
+                        .set_site_permission(&env.host, &env.perm, decision);
+                    self.sync_site_perms_shared();
+                    self.push_site_perms_to_tab(active_idx);
+                    self.reload_active_internal_if_matching();
+                }
+            }
+            "clear_site_perms" => {
+                let target = if env.host.trim().is_empty() {
+                    None
+                } else {
+                    Some(env.host.as_str())
+                };
+                self.storage.clear_site_permissions(target);
+                self.sync_site_perms_shared();
+                self.push_site_perms_to_tab(active_idx);
+                self.reload_active_internal_if_matching();
             }
             "clear_history" => {
                 self.storage.clear_history();
@@ -1829,6 +2025,7 @@ fn main() {
         .expect("Başlatıcı oluşturulamadı");
 
     let download_dir_shared = Arc::new(RwLock::new(storage.effective_download_dir()));
+    let site_perms_shared = Arc::new(RwLock::new(storage.settings.site_permissions.clone()));
 
     let mut app = BrowserApp {
         window,
@@ -1836,6 +2033,7 @@ fn main() {
         proxy_port: local_proxy.port,
         storage,
         download_dir_shared,
+        site_perms_shared,
         passwords,
         adblock,
         dns_guard,
@@ -1853,6 +2051,7 @@ fn main() {
         active_tab_idx: 0,
         next_tab_id: 1,
         pending_password: None,
+        pending_perm: None,
         launcher_webview: Some(launcher_webview),
         launcher_ready: false,
         in_launcher: true,
@@ -2074,6 +2273,7 @@ fn main() {
                                     let _ = app.tabs[pos].webview.evaluate_script(&js);
                                 }
                                 app.push_pw_hints_to_tab(pos);
+                                app.push_site_perms_to_tab(pos);
                             }
                             let _ = app.tabs[pos].webview.zoom(app.storage.settings.effective_zoom());
                             if pos == app.active_tab_idx {

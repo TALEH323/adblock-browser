@@ -1,5 +1,16 @@
 [
   {
+    "version": "0.3.8",
+    "date": "2026-11-12",
+    "title": "Site İzinleri Sistemi (Bildirim, Mikrofon, Kamera, Dosya, Konum, Pano)",
+    "tag": "v0.3.8",
+    "changes": [
+      "Chrome tarzı site bazlı izin istemi (İzin Ver / Engelle) ve kalıcı izin yönetimi eklendi",
+      "Bildirimler, Mikrofon, Kamera, Yerel Dosya Erişimi, Konum ve Pano Okuma izinleri desteklendi",
+      "Adres çubuğu kilit menüsü ve Ayarlar sayfasına site izin kontrolleri eklendi"
+    ]
+  },
+  {
     "version": "0.3.7",
     "date": "2026-11-12",
     "title": "macOS Tam Ekran & Video Tam Ekran Düzeltmesi",

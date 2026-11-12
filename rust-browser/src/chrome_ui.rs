@@ -1,7 +1,7 @@
 use crate::adblock_engine::{AdBlockService, BlockedItem};
 use crate::dns_guard::DnsCheckResult;
 use crate::passwords::SavedCredential;
-use crate::storage::{BookmarkEntry, BrowserStorage, DownloadEntry};
+use crate::storage::{BookmarkEntry, BrowserStorage, DownloadEntry, SitePermissionEntry};
 use html_escape::{encode_double_quoted_attribute as attr, encode_text as txt};
 use serde::Serialize;
 
@@ -457,6 +457,12 @@ pub enum PopoverKind<'a> {
         dns_on: bool,
         http_allowed: bool,
         dns_res: Option<&'a DnsCheckResult>,
+        perms: Option<&'a SitePermissionEntry>,
+    },
+    PermissionPrompt {
+        host: &'a str,
+        perm: &'a str,
+        req_id: u64,
     },
     Downloads {
         downloads: &'a [DownloadEntry],
@@ -497,6 +503,8 @@ pub fn render_popover_html(kind: PopoverKind<'_>) -> (String, u32, u32) {
       .pill-ok { background:#81c995; color:#202124; }
       .pill-blue { background:#8ab4f8; color:#202124; }
       .chk-row { display:flex; align-items:center; gap:8px; font-size:12.5px; cursor:pointer; }
+      .perm-row { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:4px 0; font-size:12.5px; }
+      .perm-sel { background:#292a2d; color:#e8eaed; border:1px solid #3c4043; border-radius:6px; padding:3px 6px; font-size:11.5px; cursor:pointer; outline:none; }
       .scroll { max-height:290px; overflow-y:auto; display:flex; flex-direction:column; gap:5px; }
       .hidden { display:none !important; }
     </style>
@@ -621,6 +629,7 @@ pub fn render_popover_html(kind: PopoverKind<'_>) -> (String, u32, u32) {
             dns_on,
             http_allowed,
             dns_res,
+            perms,
         } => {
             let dns_text = match dns_res {
                 Some(r) if r.safe => {
@@ -645,6 +654,31 @@ pub fn render_popover_html(kind: PopoverKind<'_>) -> (String, u32, u32) {
             } else {
                 String::new()
             };
+            let perms_card = if !host.is_empty() {
+                let mut rows = String::new();
+                for (key, label) in [
+                    ("notifications", "Bildirimler"),
+                    ("microphone", "Mikrofon"),
+                    ("camera", "Kamera"),
+                    ("file_access", "Yerel Dosyalar"),
+                    ("geolocation", "Konum"),
+                    ("clipboard", "Pano Okuma"),
+                ] {
+                    let cur = perms.and_then(|p| p.get(key));
+                    rows.push_str(&format!(
+                        r###"<div class="perm-row"><span>{label}</span><select class="perm-sel" onchange="popCmd('set_site_perm', {{host:'{}', perm:'{key}', val:this.value}})"><option value="ask"{}>Sor</option><option value="allow"{}>İzin Ver</option><option value="block"{}>Engelle</option></select></div>"###,
+                        attr(host),
+                        if cur.is_none() { " selected" } else { "" },
+                        if cur == Some(true) { " selected" } else { "" },
+                        if cur == Some(false) { " selected" } else { "" },
+                    ));
+                }
+                format!(
+                    r###"<div class="card"><div style="font-weight:600; margin-bottom:4px;">Site İzinleri</div>{rows}</div>"###
+                )
+            } else {
+                String::new()
+            };
             let html = format!(
                 r###"<!DOCTYPE html><html><head>{base_head}</head><body><div class="bubble">
                   <div class="hdr">
@@ -660,6 +694,7 @@ pub fn render_popover_html(kind: PopoverKind<'_>) -> (String, u32, u32) {
                     <div style="font-weight:600;">DNS Güvenlik Kalkanı</div>
                     <div class="sub">{}</div>
                   </div>
+                  {perms_card}
                   <button class="menu-row" onclick="popCmd('open_internal', {{route:'settings'}})">
                     <div class="mr-txt"><div class="mr-t">Site ve Güvenlik Ayarları</div><div class="mr-s">Ayarlar sekmesinde yönet</div></div>
                     <span>↗</span>
@@ -671,7 +706,46 @@ pub fn render_popover_html(kind: PopoverKind<'_>) -> (String, u32, u32) {
                 if https_only { "Açık" } else { "Kapalı" },
                 txt(&dns_text),
             );
-            (html, 340, 310)
+            let h = if host.is_empty() { 310 } else { 470 };
+            (html, 340, h)
+        }
+        PopoverKind::PermissionPrompt { host, perm, req_id } => {
+            let (label, desc) = match perm {
+                "notifications" => ("Bildirimler", "Size bildirim göndermek istiyor"),
+                "microphone" => ("Mikrofon", "Mikrofonunuzu kullanmak istiyor"),
+                "camera" => ("Kamera", "Kameranıza erişmek istiyor"),
+                "file_access" => ("Yerel Dosyalar", "Cihazınızdaki dosyalara veya klasörlere erişmek istiyor"),
+                "geolocation" => ("Konum", "Konumunuzu öğrenmek istiyor"),
+                "clipboard" => ("Pano Okuma", "Panonuzdaki metin ve görselleri okumak istiyor"),
+                _ => ("Site İzni", "Bu özellik için izin istiyor"),
+            };
+            let html = format!(
+                r###"<!DOCTYPE html><html><head>{base_head}</head><body><div class="bubble">
+                  <div class="hdr">
+                    <div class="hdr-title">{}</div>
+                    <button class="ico-btn" onclick="popCmd('perm_decide', {{host:'{}', perm:'{}', id:{}, allowed:false}})">×</button>
+                  </div>
+                  <div class="card">
+                    <div style="font-weight:600; font-size:13.5px;">{label}</div>
+                    <div class="sub">{desc}</div>
+                  </div>
+                  <div class="row" style="justify-content:flex-end; gap:8px;">
+                    <button class="pill-btn pill-danger" onclick="popCmd('perm_decide', {{host:'{}', perm:'{}', id:{}, allowed:false}})">Engelle</button>
+                    <button class="pill-btn pill-ok" onclick="popCmd('perm_decide', {{host:'{}', perm:'{}', id:{}, allowed:true}})">İzin Ver</button>
+                  </div>
+                </div></body></html>"###,
+                txt(host),
+                attr(host),
+                attr(perm),
+                req_id,
+                attr(host),
+                attr(perm),
+                req_id,
+                attr(host),
+                attr(perm),
+                req_id,
+            );
+            (html, 330, 175)
         }
         PopoverKind::Downloads { downloads } => {
             let mut rows = String::new();
@@ -828,8 +902,18 @@ mod tests {
             dns_on: true,
             http_allowed: false,
             dns_res: None,
+            perms: None,
         });
         assert!(sec_html.contains("Bağlantı güvenli (HTTPS)"));
+        assert!(sec_html.contains("Site İzinleri"));
+
+        let (perm_html, _, _) = render_popover_html(PopoverKind::PermissionPrompt {
+            host: "meet.example.com",
+            perm: "microphone",
+            req_id: 7,
+        });
+        assert!(perm_html.contains("Mikrofon"));
+        assert!(perm_html.contains("İzin Ver"));
 
         let (menu_html, _, _) = render_popover_html(PopoverKind::Menu {
             show_bookmarks_bar: true,

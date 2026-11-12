@@ -1,8 +1,260 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SitePermissionEntry {
+    #[serde(default)]
+    pub notifications: Option<bool>,
+    #[serde(default)]
+    pub microphone: Option<bool>,
+    #[serde(default)]
+    pub camera: Option<bool>,
+    #[serde(default)]
+    pub file_access: Option<bool>,
+    #[serde(default)]
+    pub geolocation: Option<bool>,
+    #[serde(default)]
+    pub clipboard: Option<bool>,
+}
+
+impl SitePermissionEntry {
+    pub fn get(&self, kind: &str) -> Option<bool> {
+        match kind {
+            "notifications" => self.notifications,
+            "microphone" => self.microphone,
+            "camera" => self.camera,
+            "file_access" => self.file_access,
+            "geolocation" => self.geolocation,
+            "clipboard" => self.clipboard,
+            _ => None,
+        }
+    }
+
+    pub fn set(&mut self, kind: &str, val: Option<bool>) {
+        match kind {
+            "notifications" => self.notifications = val,
+            "microphone" => self.microphone = val,
+            "camera" => self.camera = val,
+            "file_access" => self.file_access = val,
+            "geolocation" => self.geolocation = val,
+            "clipboard" => self.clipboard = val,
+            _ => {}
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.notifications.is_none()
+            && self.microphone.is_none()
+            && self.camera.is_none()
+            && self.file_access.is_none()
+            && self.geolocation.is_none()
+            && self.clipboard.is_none()
+    }
+}
+
+pub fn normalize_perm_host(host: &str) -> String {
+    let h = host.trim().to_lowercase();
+    h.strip_prefix("www.").unwrap_or(&h).to_string()
+}
+
+/// Document-start permission interception script providing Chrome-like per-site prompts & state.
+pub const PERMISSION_INJECT_JS: &str = r##"
+(() => {
+  if (window.__abPermInit) return;
+  window.__abPermInit = true;
+  if (!location.protocol.startsWith('http')) return;
+
+  window.__abSitePerms = window.__abSitePerms || {};
+  let nextReqId = 1;
+  const pending = new Map();
+
+  window.__abSetSitePerms = (map) => {
+    if (map && typeof map === 'object') {
+      window.__abSitePerms = map;
+    }
+  };
+
+  window.__abResolvePerm = (reqId, allowed, permName) => {
+    if (permName && typeof allowed === 'boolean') {
+      window.__abSitePerms[permName] = allowed;
+    }
+    const entry = pending.get(reqId);
+    if (entry) {
+      pending.delete(reqId);
+      entry.resolve(!!allowed);
+    }
+  };
+
+  function requestPerm(permName) {
+    const cached = window.__abSitePerms[permName];
+    if (cached === true) return Promise.resolve(true);
+    if (cached === false) return Promise.resolve(false);
+    if (!window.ipc) return Promise.resolve(false);
+    const id = nextReqId++;
+    return new Promise((resolve) => {
+      pending.set(id, { resolve });
+      try {
+        window.ipc.postMessage(JSON.stringify({
+          type: 'ui_cmd',
+          cmd: 'perm_request',
+          perm: permName,
+          id
+        }));
+      } catch (_) {
+        pending.delete(id);
+        resolve(false);
+      }
+      setTimeout(() => {
+        if (pending.has(id)) {
+          pending.delete(id);
+          resolve(false);
+        }
+      }, 60000);
+    });
+  }
+
+  // 1. Notifications
+  if (window.Notification) {
+    const OrigNotif = window.Notification;
+    try {
+      Object.defineProperty(OrigNotif, 'permission', {
+        configurable: true,
+        get() {
+          const v = window.__abSitePerms.notifications;
+          if (v === true) return 'granted';
+          if (v === false) return 'denied';
+          return 'default';
+        }
+      });
+    } catch (_) {}
+    const WrappedNotif = function(title, opts) {
+      if (window.__abSitePerms.notifications !== true) {
+        throw new TypeError('Notification permission not granted');
+      }
+      return new OrigNotif(title, opts);
+    };
+    WrappedNotif.prototype = OrigNotif.prototype;
+    Object.defineProperty(WrappedNotif, 'permission', {
+      configurable: true,
+      get() {
+        const v = window.__abSitePerms.notifications;
+        return v === true ? 'granted' : (v === false ? 'denied' : 'default');
+      }
+    });
+    WrappedNotif.requestPermission = (cb) => {
+      return requestPerm('notifications').then((ok) => {
+        const res = ok ? 'granted' : 'denied';
+        if (typeof cb === 'function') {
+          try { cb(res); } catch (_) {}
+        }
+        return res;
+      });
+    };
+    if ('maxActions' in OrigNotif) WrappedNotif.maxActions = OrigNotif.maxActions;
+    try { window.Notification = WrappedNotif; } catch (_) {}
+  }
+
+  // 2. Microphone & Camera (getUserMedia)
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    const origGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    navigator.mediaDevices.getUserMedia = async function(constraints) {
+      const c = constraints || {};
+      if (c.audio) {
+        const okMic = await requestPerm('microphone');
+        if (!okMic) throw new DOMException('Microphone permission denied', 'NotAllowedError');
+      }
+      if (c.video) {
+        const okCam = await requestPerm('camera');
+        if (!okCam) throw new DOMException('Camera permission denied', 'NotAllowedError');
+      }
+      return origGUM(constraints);
+    };
+  }
+
+  // 3. Local File System Access (File System Access API)
+  for (const fnName of ['showOpenFilePicker', 'showSaveFilePicker', 'showDirectoryPicker']) {
+    if (typeof window[fnName] === 'function') {
+      const origPicker = window[fnName].bind(window);
+      window[fnName] = async function(...args) {
+        const ok = await requestPerm('file_access');
+        if (!ok) throw new DOMException('File access permission denied', 'NotAllowedError');
+        return origPicker(...args);
+      };
+    }
+  }
+
+  // 4. Geolocation
+  if (navigator.geolocation) {
+    const origGetPos = navigator.geolocation.getCurrentPosition.bind(navigator.geolocation);
+    const origWatchPos = navigator.geolocation.watchPosition.bind(navigator.geolocation);
+    navigator.geolocation.getCurrentPosition = (success, error, opts) => {
+      requestPerm('geolocation').then((ok) => {
+        if (ok) origGetPos(success, error, opts);
+        else if (typeof error === 'function') error({ code: 1, message: 'User denied Geolocation', PERMISSION_DENIED: 1 });
+      });
+    };
+    navigator.geolocation.watchPosition = (success, error, opts) => {
+      let realId = 0;
+      requestPerm('geolocation').then((ok) => {
+        if (ok) realId = origWatchPos(success, error, opts);
+        else if (typeof error === 'function') error({ code: 1, message: 'User denied Geolocation', PERMISSION_DENIED: 1 });
+      });
+      return realId;
+    };
+  }
+
+  // 5. Clipboard Read
+  if (navigator.clipboard) {
+    if (typeof navigator.clipboard.readText === 'function') {
+      const origReadText = navigator.clipboard.readText.bind(navigator.clipboard);
+      navigator.clipboard.readText = async () => {
+        const ok = await requestPerm('clipboard');
+        if (!ok) throw new DOMException('Clipboard read denied', 'NotAllowedError');
+        return origReadText();
+      };
+    }
+    if (typeof navigator.clipboard.read === 'function') {
+      const origRead = navigator.clipboard.read.bind(navigator.clipboard);
+      navigator.clipboard.read = async () => {
+        const ok = await requestPerm('clipboard');
+        if (!ok) throw new DOMException('Clipboard read denied', 'NotAllowedError');
+        return origRead();
+      };
+    }
+  }
+
+  // 6. navigator.permissions.query synchronization
+  if (navigator.permissions && typeof navigator.permissions.query === 'function') {
+    const origQuery = navigator.permissions.query.bind(navigator.permissions);
+    const mapName = {
+      'notifications': 'notifications',
+      'microphone': 'microphone',
+      'camera': 'camera',
+      'geolocation': 'geolocation',
+      'clipboard-read': 'clipboard'
+    };
+    navigator.permissions.query = async function(desc) {
+      const key = desc && mapName[desc.name];
+      if (key) {
+        const val = window.__abSitePerms[key];
+        const state = val === true ? 'granted' : (val === false ? 'denied' : 'prompt');
+        return {
+          name: desc.name,
+          state,
+          onchange: null,
+          addEventListener() {},
+          removeEventListener() {},
+          dispatchEvent() { return true; }
+        };
+      }
+      return origQuery(desc);
+    };
+  }
+})();
+"##;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserSettings {
@@ -44,6 +296,8 @@ pub struct BrowserSettings {
     pub background_throttling: bool,
     #[serde(default)]
     pub download_dir: String,
+    #[serde(default)]
+    pub site_permissions: BTreeMap<String, SitePermissionEntry>,
 }
 
 fn default_true() -> bool {
@@ -94,6 +348,7 @@ impl Default for BrowserSettings {
             default_zoom: default_zoom_factor(),
             background_throttling: true,
             download_dir: String::new(),
+            site_permissions: BTreeMap::new(),
         }
     }
 }
@@ -347,6 +602,41 @@ impl BrowserStorage {
         }
         self.save_settings();
     }
+
+    pub fn get_site_permission(&self, host: &str, kind: &str) -> Option<bool> {
+        let h = normalize_perm_host(host);
+        if h.is_empty() {
+            return None;
+        }
+        self.settings
+            .site_permissions
+            .get(&h)
+            .and_then(|e| e.get(kind))
+    }
+
+    pub fn set_site_permission(&mut self, host: &str, kind: &str, val: Option<bool>) {
+        let h = normalize_perm_host(host);
+        if h.is_empty() {
+            return;
+        }
+        let entry = self.settings.site_permissions.entry(h.clone()).or_default();
+        entry.set(kind, val);
+        if entry.is_empty() {
+            self.settings.site_permissions.remove(&h);
+        }
+        self.save_settings();
+    }
+
+    pub fn clear_site_permissions(&mut self, host: Option<&str>) {
+        match host {
+            Some(raw) => {
+                let h = normalize_perm_host(raw);
+                self.settings.site_permissions.remove(&h);
+            }
+            None => self.settings.site_permissions.clear(),
+        }
+        self.save_settings();
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +691,32 @@ mod tests {
         assert!(st.settings.download_dir.is_empty());
         assert_eq!(st.settings.update_token, "ghp_secret");
 
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn site_permissions_persist_and_clear() {
+        let tmp = std::env::temp_dir().join(format!("ab_test_perms_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        {
+            let mut st = BrowserStorage::load(tmp.clone());
+            assert_eq!(st.get_site_permission("www.meet.google.com", "microphone"), None);
+            st.set_site_permission("www.meet.google.com", "microphone", Some(true));
+            st.set_site_permission("meet.google.com", "camera", Some(false));
+            st.set_site_permission("example.com", "notifications", Some(true));
+            st.set_site_permission("example.com", "file_access", Some(false));
+            assert_eq!(st.get_site_permission("meet.google.com", "microphone"), Some(true));
+            assert_eq!(st.get_site_permission("www.meet.google.com", "camera"), Some(false));
+        }
+        let mut reloaded = BrowserStorage::load(tmp.clone());
+        assert_eq!(reloaded.get_site_permission("meet.google.com", "microphone"), Some(true));
+        assert_eq!(reloaded.get_site_permission("example.com", "file_access"), Some(false));
+        reloaded.clear_site_permissions(Some("example.com"));
+        assert_eq!(reloaded.get_site_permission("example.com", "notifications"), None);
+        reloaded.clear_site_permissions(None);
+        assert!(reloaded.settings.site_permissions.is_empty());
+        assert!(PERMISSION_INJECT_JS.contains("showOpenFilePicker"));
+        assert!(PERMISSION_INJECT_JS.contains("Notification"));
         let _ = fs::remove_dir_all(&tmp);
     }
 }

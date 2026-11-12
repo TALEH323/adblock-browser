@@ -41,6 +41,10 @@ cat > "$CONTENTS/Info.plist" << 'EOF'
   <string>APPL</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>AdBlock Tarayıcı, web sitelerinde sesli görüşme ve kayıt için mikrofon erişimi ister.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>AdBlock Tarayıcı, web sitelerinde görüntülü görüşme için kamera erişimi ister.</string>
 </dict>
 </plist>
 EOF
