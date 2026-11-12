@@ -707,6 +707,47 @@ impl BrowserApp {
         }
     }
 
+    fn live_tab_url(tab: &BrowserTab) -> String {
+        tab.webview
+            .url()
+            .ok()
+            .filter(|u| u.starts_with("http"))
+            .unwrap_or_else(|| tab.url.clone())
+    }
+
+    fn push_pw_hints_to_tab(&self, tab_idx: usize) {
+        let Some(tab) = self.tabs.get(tab_idx) else {
+            return;
+        };
+        if tab.internal_route.is_some() {
+            return;
+        }
+        let live_url = Self::live_tab_url(tab);
+        if !live_url.starts_with("http") {
+            return;
+        }
+        let host = extract_host(&live_url);
+        let hints: Vec<serde_json::Value> = if host.is_empty() {
+            Vec::new()
+        } else {
+            self.passwords
+                .for_origin(&host)
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "origin": c.origin,
+                        "username": c.username,
+                    })
+                })
+                .collect()
+        };
+        if let Ok(json) = serde_json::to_string(&hints) {
+            let _ = tab.webview.evaluate_script(&format!(
+                "window.__adblockSetPwHints && window.__adblockSetPwHints({json});"
+            ));
+        }
+    }
+
     fn sync_chrome_bar(&self) {
         if !self.chrome_ready {
             return;
@@ -1133,11 +1174,13 @@ impl BrowserApp {
                 self.pending_password = None;
                 self.close_popover();
                 self.reload_active_internal_if_matching();
+                self.push_pw_hints_to_tab(active_idx);
                 self.sync_chrome_bar();
             }
             "pw_import_csv" => {
                 self.passwords.import_chrome_csv(&env.csv_data);
                 self.reload_active_internal_if_matching();
+                self.push_pw_hints_to_tab(active_idx);
                 self.sync_chrome_bar();
             }
             "pw_clear_notice" => {
@@ -1183,7 +1226,49 @@ impl BrowserApp {
                 if let Some(i) = env.idx {
                     self.passwords.delete_at(i);
                     self.reload_active_internal_if_matching();
+                    self.push_pw_hints_to_tab(active_idx);
                     self.sync_chrome_bar();
+                }
+            }
+            "pw_query_hints" => {
+                let target_idx = source_tab_id
+                    .and_then(|id| self.tabs.iter().position(|t| t.id == id))
+                    .unwrap_or(active_idx);
+                if target_idx == active_idx {
+                    self.push_pw_hints_to_tab(target_idx);
+                }
+            }
+            "pw_fill_inline" => {
+                let target_idx = source_tab_id
+                    .and_then(|id| self.tabs.iter().position(|t| t.id == id))
+                    .unwrap_or(active_idx);
+                if target_idx != active_idx {
+                    return;
+                }
+                if let Some(t) = self.tabs.get(target_idx) {
+                    if t.internal_route.is_some() {
+                        return;
+                    }
+                    let live_url = Self::live_tab_url(t);
+                    let host = extract_host(&live_url);
+                    if host.is_empty() {
+                        return;
+                    }
+                    let matches = self.passwords.for_origin(&host);
+                    let picked = matches
+                        .iter()
+                        .find(|c| {
+                            (env.origin.is_empty() || c.origin == env.origin)
+                                && c.username == env.username
+                        })
+                        .or_else(|| matches.iter().find(|c| c.username == env.username));
+                    if let Some(cred) = picked {
+                        let u_json = serde_json::to_string(&cred.username).unwrap_or_default();
+                        let p_json = serde_json::to_string(&cred.password).unwrap_or_default();
+                        let _ = t.webview.evaluate_script(&format!(
+                            "window.__adblockFillPassword && window.__adblockFillPassword({u_json}, {p_json});"
+                        ));
+                    }
                 }
             }
             "pw_fill" => {
@@ -1833,6 +1918,7 @@ fn main() {
                                 if !js.is_empty() {
                                     let _ = app.tabs[pos].webview.evaluate_script(&js);
                                 }
+                                app.push_pw_hints_to_tab(pos);
                             }
                             let _ = app.tabs[pos].webview.zoom(app.storage.settings.effective_zoom());
                             if pos == app.active_tab_idx {

@@ -391,53 +391,469 @@ fn parse_csv_rows(input: &str) -> Vec<Vec<String>> {
     rows
 }
 
-/// Page script injected into websites to detect login form submission & autofill credentials.
-pub const PASSWORD_INJECT_JS: &str = r#"
+/// Page script injected into websites to detect login form submission, show inline account suggestions & autofill credentials.
+pub const PASSWORD_INJECT_JS: &str = r##"
 (() => {
   if (window.__adblockPwInit) return;
   window.__adblockPwInit = true;
   if (!location.protocol.startsWith('http')) return;
 
-  function findCredentials(form) {
-    const scope = form || document;
-    const pw = scope.querySelector('input[type="password"]');
-    if (!pw || !pw.value) return null;
-    const userSel = [
-      'input[autocomplete="username"]',
-      'input[type="email"]',
-      'input[name*="user" i]',
-      'input[name*="mail" i]',
-      'input[name*="login" i]',
-      'input[type="text"]'
-    ].join(',');
-    let userEl = null;
-    for (const el of scope.querySelectorAll(userSel)) {
-      if (el !== pw && el.offsetParent !== null) { userEl = el; break; }
+  const IS_TOP = window.top === window.self;
+  const USER_SELECTORS = [
+    'input[autocomplete="username"]',
+    'input[autocomplete="email"]',
+    'input[type="email"]',
+    'input[name*="user" i]',
+    'input[name*="mail" i]',
+    'input[name*="login" i]',
+    'input[id*="user" i]',
+    'input[id*="mail" i]',
+    'input[type="text"]',
+    'input[type="tel"]'
+  ].join(',');
+
+  function isVisible(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && el.offsetParent !== null;
+  }
+
+  function inputMeta(el) {
+    return (
+      (el.name || '') + ' ' +
+      (el.id || '') + ' ' +
+      (el.placeholder || '') + ' ' +
+      (el.getAttribute('aria-label') || '') + ' ' +
+      (el.getAttribute('autocomplete') || '')
+    ).toLowerCase();
+  }
+
+  function isSearchBox(el) {
+    if (!el || el.type === 'password') return false;
+    const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+    if (/username|current-password|new-password|email/.test(ac)) return false;
+    if (el.type === 'search' || el.getAttribute('role') === 'searchbox') return true;
+    const meta = inputMeta(el);
+    return /(?:^|\s)(q|s|query|search|search_query|keyword|keywords|filter|ara)(?:\s|$)/.test(meta) ||
+      /\b(search|ara\b|filter)\b/.test(meta);
+  }
+
+  function isEligibleLoginInput(el) {
+    if (!el || el.tagName !== 'INPUT' || el.disabled || el.readOnly) return false;
+    const t = (el.type || 'text').toLowerCase();
+    if (/^(hidden|checkbox|radio|submit|button|reset|file|image|range|color|date|datetime-local|month|time|week|search)$/.test(t)) {
+      return false;
     }
-    return { origin: location.hostname, username: userEl ? userEl.value : '', password: pw.value };
+    if (t === 'password' || t === 'email') return !isSearchBox(el);
+    const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+    if (/username|current-password|new-password|email/.test(ac)) return true;
+    if (isSearchBox(el)) return false;
+    const meta = inputMeta(el);
+    if (/(otp|one-time|two-factor|2fa|captcha|dogrulama|pin\b)/.test(meta)) return false;
+    const scope = el.form || (el.closest && el.closest('[role="dialog"], main, section, form'));
+    if (scope && scope.querySelector('input[type="password"]')) return true;
+    return /(user|mail|login|account|auth|phone|tel|telefon|nick|handle|kullanici|eposta|e-posta|hesap|giris|oturum|identifier|session|uye|member|kimlik)/.test(meta);
+  }
+
+  function findPasswordInput(scope, preferred) {
+    if (preferred && preferred.type === 'password' && document.contains(preferred)) return preferred;
+    const list = Array.from((scope || document).querySelectorAll('input[type="password"]'));
+    return list.find(isVisible) || list[0] || null;
+  }
+
+  function findUserInput(scope, pw, preferred) {
+    if (preferred && preferred !== pw && preferred.type !== 'password' && document.contains(preferred) && !isSearchBox(preferred)) {
+      return preferred;
+    }
+    const candidates = Array.from((scope || document).querySelectorAll(USER_SELECTORS))
+      .filter((el) => el !== pw && !isSearchBox(el) && isVisible(el));
+    const nonEmpty = candidates.find((el) => (el.value || '').trim().length > 0);
+    return nonEmpty || candidates[0] || null;
+  }
+
+  function findCredentials(scope) {
+    const root = scope && scope.querySelectorAll ? scope : document;
+    const pws = Array.from(root.querySelectorAll('input[type="password"]'));
+    const pw = pws.find((el) => el.value && isVisible(el)) || pws.find((el) => !!el.value);
+    if (!pw || !pw.value) return null;
+    const userEl = findUserInput(root, pw, null) || (root !== document ? findUserInput(document, pw, null) : null);
+    return {
+      origin: location.hostname,
+      username: userEl ? userEl.value : '',
+      password: pw.value
+    };
+  }
+
+  let lastCaptureSig = '';
+  let lastCaptureAt = 0;
+  function reportCredentials(scope) {
+    const creds = findCredentials(scope);
+    if (!creds || !creds.password || !window.ipc) return;
+    const sig = creds.origin + '\0' + creds.username + '\0' + creds.password;
+    const now = Date.now();
+    if (sig === lastCaptureSig && now - lastCaptureAt < 2000) return;
+    lastCaptureSig = sig;
+    lastCaptureAt = now;
+    window.ipc.postMessage(JSON.stringify({ type: 'pw_capture', ...creds }));
   }
 
   document.addEventListener('submit', (e) => {
-    const creds = findCredentials(e.target);
-    if (creds && creds.password && window.ipc) {
-      window.ipc.postMessage(JSON.stringify({ type: 'pw_capture', ...creds }));
+    reportCredentials(e.target);
+  }, true);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target && e.target.tagName === 'INPUT' && e.target.type === 'password') {
+      const scope = e.target.form || e.target.closest('[role="dialog"], main, section') || document;
+      reportCredentials(scope);
     }
   }, true);
 
+  document.addEventListener('click', (e) => {
+    const btn = e.target && e.target.closest ? e.target.closest('button, input[type="submit"], [role="button"]') : null;
+    if (!btn) return;
+    const txt = ((btn.innerText || btn.value || '') + ' ' + (btn.getAttribute('aria-label') || '')).toLowerCase();
+    const looksSubmit = btn.type === 'submit' ||
+      /(giriş|giris|sign\s*in|log\s*in|devam|continue|submit|next|ileri|oturum)/.test(txt);
+    if (!looksSubmit) return;
+    const scope = btn.form || btn.closest('[role="dialog"], main, section') || document;
+    reportCredentials(scope);
+  }, true);
+
+  let activeInput = null;
+  let suppressOpenUntil = 0;
+
+  // --- Inline Autofill Suggestions (Top Frame Only) ---
+  let hints = [];
+  let hintsHost = '';
+  let lastQueryAt = 0;
+  let visibleItems = [];
+  let selectedIdx = -1;
+  let hostEl = null;
+  let shadowRoot = null;
+  let cardEl = null;
+  let listEl = null;
+
+  function ensureUi() {
+    if (hostEl && document.contains(hostEl)) return true;
+    if (!document.documentElement) return false;
+    hostEl = document.createElement('div');
+    hostEl.setAttribute('data-ab-pw-autofill', '1');
+    hostEl.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;pointer-events:none;';
+    shadowRoot = hostEl.attachShadow({ mode: 'closed' });
+    const style = document.createElement('style');
+    style.textContent = `
+      :host { all: initial; }
+      .card {
+        position: fixed;
+        display: none;
+        pointer-events: auto;
+        box-sizing: border-box;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: #ffffff;
+        color: #0f172a;
+        border: 1px solid rgba(15, 23, 42, 0.16);
+        border-radius: 10px;
+        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22);
+        overflow: hidden;
+        user-select: none;
+      }
+      @media (prefers-color-scheme: dark) {
+        .card {
+          background: #1f2430;
+          color: #eef2ff;
+          border-color: rgba(255, 255, 255, 0.14);
+          box-shadow: 0 14px 34px rgba(0, 0, 0, 0.55);
+        }
+      }
+      .hdr {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 7px 11px 5px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        opacity: 0.72;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.16);
+      }
+      .list {
+        max-height: 224px;
+        overflow-y: auto;
+        padding: 4px;
+      }
+      .item {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 7px 9px;
+        border-radius: 7px;
+        cursor: pointer;
+      }
+      .item:hover, .item.sel {
+        background: rgba(59, 130, 246, 0.16);
+      }
+      .ico {
+        width: 26px;
+        height: 26px;
+        border-radius: 999px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(59, 130, 246, 0.16);
+        color: #3b82f6;
+        flex-shrink: 0;
+      }
+      .meta {
+        min-width: 0;
+        flex: 1;
+      }
+      .usr {
+        font-size: 13px;
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .sub {
+        font-size: 11px;
+        opacity: 0.68;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        margin-top: 1px;
+      }
+    `;
+    cardEl = document.createElement('div');
+    cardEl.className = 'card';
+    const hdr = document.createElement('div');
+    hdr.className = 'hdr';
+    hdr.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg><span>Kayıtlı Hesaplar</span>';
+    listEl = document.createElement('div');
+    listEl.className = 'list';
+    cardEl.appendChild(hdr);
+    cardEl.appendChild(listEl);
+    shadowRoot.appendChild(style);
+    shadowRoot.appendChild(cardEl);
+    document.documentElement.appendChild(hostEl);
+    return true;
+  }
+
+  function hideDropdown() {
+    selectedIdx = -1;
+    visibleItems = [];
+    if (cardEl) cardEl.style.display = 'none';
+  }
+
+  function selectHint(item) {
+    if (!item || !window.ipc) return;
+    suppressOpenUntil = Date.now() + 500;
+    hideDropdown();
+    window.ipc.postMessage(JSON.stringify({
+      type: 'ui_cmd',
+      cmd: 'pw_fill_inline',
+      origin: item.origin || '',
+      username: item.username || ''
+    }));
+  }
+
+  function syncSelectionStyles() {
+    if (!listEl) return;
+    const rows = listEl.querySelectorAll('.item');
+    rows.forEach((row, idx) => {
+      if (idx === selectedIdx) {
+        row.classList.add('sel');
+        row.scrollIntoView({ block: 'nearest' });
+      } else {
+        row.classList.remove('sel');
+      }
+    });
+  }
+
+  function filterHintsFor(el) {
+    if (!hints.length) return [];
+    if (!el || el.type === 'password') return hints;
+    const q = (el.value || '').trim().toLowerCase();
+    if (!q || hints.some((h) => (h.username || '').toLowerCase() === q)) return hints;
+    return hints.filter((h) => (h.username || '').toLowerCase().includes(q));
+  }
+
+  function positionDropdown() {
+    if (!cardEl || !activeInput || !document.contains(activeInput)) return;
+    const r = activeInput.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0 || r.bottom < 0 || r.top > window.innerHeight) {
+      hideDropdown();
+      return;
+    }
+    const width = Math.min(Math.max(r.width, 250), Math.min(360, window.innerWidth - 16));
+    const left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8));
+    cardEl.style.width = width + 'px';
+    cardEl.style.left = left + 'px';
+    cardEl.style.top = Math.round(r.bottom + 4) + 'px';
+    const ch = cardEl.offsetHeight || 160;
+    if (r.bottom + 4 + ch > window.innerHeight - 8 && r.top - 4 - ch >= 8) {
+      cardEl.style.top = Math.round(r.top - 4 - ch) + 'px';
+    }
+  }
+
+  function showDropdown() {
+    if (!IS_TOP) return;
+    if (Date.now() < suppressOpenUntil) return;
+    if (!activeInput || !document.contains(activeInput) || document.activeElement !== activeInput) {
+      hideDropdown();
+      return;
+    }
+    const items = filterHintsFor(activeInput);
+    if (!items.length || !ensureUi()) {
+      hideDropdown();
+      return;
+    }
+    visibleItems = items;
+    if (selectedIdx >= visibleItems.length) selectedIdx = -1;
+    listEl.textContent = '';
+    items.forEach((item, idx) => {
+      const row = document.createElement('div');
+      row.className = 'item' + (idx === selectedIdx ? ' sel' : '');
+
+      const ico = document.createElement('div');
+      ico.className = 'ico';
+      ico.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
+
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+
+      const usr = document.createElement('div');
+      usr.className = 'usr';
+      usr.textContent = item.username || '(Kullanıcı adı yok)';
+
+      const sub = document.createElement('div');
+      sub.className = 'sub';
+      sub.textContent = '••••••••  ·  ' + (item.origin || location.hostname);
+
+      meta.appendChild(usr);
+      meta.appendChild(sub);
+      row.appendChild(ico);
+      row.appendChild(meta);
+
+      row.addEventListener('mouseenter', () => {
+        selectedIdx = idx;
+        syncSelectionStyles();
+      });
+      row.addEventListener('mousedown', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        selectHint(item);
+      });
+      listEl.appendChild(row);
+    });
+    cardEl.style.display = 'block';
+    positionDropdown();
+  }
+
+  function requestHintsIfNeeded() {
+    if (!IS_TOP || !window.ipc) return;
+    const now = Date.now();
+    if (hintsHost !== location.hostname || now - lastQueryAt > 1500) {
+      lastQueryAt = now;
+      window.ipc.postMessage(JSON.stringify({ type: 'ui_cmd', cmd: 'pw_query_hints' }));
+    }
+  }
+
+  if (IS_TOP) {
+    window.__adblockSetPwHints = (list) => {
+      hints = Array.isArray(list) ? list : [];
+      hintsHost = location.hostname;
+      if (activeInput && document.activeElement === activeInput) {
+        showDropdown();
+      }
+    };
+
+    document.addEventListener('focusin', (e) => {
+      if (isEligibleLoginInput(e.target)) {
+        activeInput = e.target;
+        selectedIdx = -1;
+        requestHintsIfNeeded();
+        showDropdown();
+      } else {
+        hideDropdown();
+      }
+    }, true);
+
+    document.addEventListener('click', (e) => {
+      if (isEligibleLoginInput(e.target)) {
+        activeInput = e.target;
+        requestHintsIfNeeded();
+        showDropdown();
+      } else if (e.target !== hostEl) {
+        hideDropdown();
+      }
+    }, true);
+
+    document.addEventListener('input', (e) => {
+      if (e.target === activeInput) {
+        selectedIdx = -1;
+        showDropdown();
+      }
+    }, true);
+
+    document.addEventListener('focusout', () => {
+      setTimeout(() => {
+        if (!activeInput || document.activeElement !== activeInput) {
+          hideDropdown();
+        }
+      }, 90);
+    }, true);
+
+    document.addEventListener('keydown', (e) => {
+      if (!cardEl || cardEl.style.display === 'none' || !visibleItems.length) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        hideDropdown();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        selectedIdx = (selectedIdx + 1) % visibleItems.length;
+        syncSelectionStyles();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        selectedIdx = selectedIdx <= 0 ? visibleItems.length - 1 : selectedIdx - 1;
+        syncSelectionStyles();
+      } else if (e.key === 'Enter' && selectedIdx >= 0 && visibleItems[selectedIdx]) {
+        e.preventDefault();
+        e.stopPropagation();
+        selectHint(visibleItems[selectedIdx]);
+      }
+    }, true);
+
+    window.addEventListener('scroll', () => {
+      if (cardEl && cardEl.style.display !== 'none') positionDropdown();
+    }, true);
+    window.addEventListener('resize', () => {
+      if (cardEl && cardEl.style.display !== 'none') positionDropdown();
+    }, true);
+  }
+
   window.__adblockFillPassword = (username, password) => {
-    const pw = document.querySelector('input[type="password"]');
-    if (!pw) return;
-    const userEl = document.querySelector('input[autocomplete="username"], input[type="email"], input[type="text"]');
+    suppressOpenUntil = Date.now() + 500;
+    hideDropdown();
+    const anchor = activeInput && document.contains(activeInput) ? activeInput : null;
+    const anchorForm = anchor && anchor.form ? anchor.form : null;
+    const pw = findPasswordInput(anchorForm || document, anchor);
+    const scope = (pw && pw.form) || anchorForm || document;
+    const userEl = findUserInput(scope, pw, anchor) ||
+      (scope !== document ? findUserInput(document, pw, anchor) : null);
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
     if (userEl && username) {
       setter.call(userEl, username);
       userEl.dispatchEvent(new Event('input', { bubbles: true }));
+      userEl.dispatchEvent(new Event('change', { bubbles: true }));
     }
-    setter.call(pw, password);
-    pw.dispatchEvent(new Event('input', { bubbles: true }));
+    if (pw && password) {
+      setter.call(pw, password);
+      pw.dispatchEvent(new Event('input', { bubbles: true }));
+      pw.dispatchEvent(new Event('change', { bubbles: true }));
+    }
   };
 })();
-"#;
+"##;
 
 #[cfg(test)]
 mod tests {
@@ -497,5 +913,15 @@ mod tests {
         let reloaded = PasswordManager::load(&tmp);
         assert_eq!(reloaded.credentials.len(), 3);
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn inject_script_supports_inline_hints_and_two_step_fill() {
+        assert!(PASSWORD_INJECT_JS.contains("__adblockSetPwHints"));
+        assert!(PASSWORD_INJECT_JS.contains("pw_query_hints"));
+        assert!(PASSWORD_INJECT_JS.contains("pw_fill_inline"));
+        assert!(PASSWORD_INJECT_JS.contains("attachShadow({ mode: 'closed' })"));
+        assert!(PASSWORD_INJECT_JS.contains("__adblockFillPassword"));
+        assert!(PASSWORD_INJECT_JS.contains("dispatchEvent(new Event('change'"));
     }
 }
