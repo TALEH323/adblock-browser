@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.3.0",
+    "date": "2026-11-12",
+    "title": "Site Önizlemeli Yer İmleri & Gelişmiş Ayarlar",
+    "tag": "v0.3.0",
+    "changes": [
+      "Ana sayfada site önizlemeli yer imleri ve gelişmiş tarayıcı ayarları"
+    ]
+  },
+  {
     "version": "0.2.0",
     "date": "2026-11-12",
     "title": "Temiz Yeni Sekme ve Otomatik Güncelleme",
